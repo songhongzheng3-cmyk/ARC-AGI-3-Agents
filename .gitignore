@@ -8,12 +8,15 @@
 .ruff_cache/
 .mypy_cache/
 **/__pycache__/
+.external/
+.kaggle/
 
 # IDE settings
 .vscode/
 
 # Recordings
-recordings/*.recording.jsonl
+recordings/
+sampling_runs/
 tests/recordings/*.recording.jsonl
 tests/recordings/not-a-recording.txt
 

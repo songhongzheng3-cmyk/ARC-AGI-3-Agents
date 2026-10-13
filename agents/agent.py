@@ -46,7 +46,7 @@ class Agent(ABC):
         agent_name: str,
         ROOT_URL: str,
         record: bool,
-        arc_env: EnvironmentWrapper,
+        arc_env: EnvironmentWrapper | None = None,
         tags: Optional[list[str]] = None,
     ) -> None:
         self.ROOT_URL = ROOT_URL
@@ -63,7 +63,7 @@ class Agent(ABC):
             "X-API-Key": os.getenv("ARC_API_KEY", ""),
             "Accept": "application/json",
         }
-        self.arc_env = arc_env
+        self.arc_env = arc_env  # type: ignore[assignment]
 
     @trace_agent_session
     def main(self) -> None:
@@ -138,7 +138,26 @@ class Agent(ABC):
         reasoning = getattr(action, "reasoning", None)
         if reasoning is not None and not isinstance(reasoning, dict):
             reasoning = {"text": str(reasoning)}
-        raw = self.arc_env.step(action, data=data, reasoning=reasoning)
+
+        # The remote environment swallows transient network failures and returns
+        # None.  A single dropped connection otherwise aborts the whole run, so
+        # retry a bounded number of times before surfacing an error.
+        raw = None
+        attempts = int(os.getenv("ARC_STEP_RETRIES", "3"))
+        for attempt in range(1, attempts + 1):
+            raw = self.arc_env.step(action, data=data, reasoning=reasoning)
+            if raw is not None:
+                break
+            if attempt < attempts:
+                delay = 1.0 * (2 ** (attempt - 1))
+                logger.warning(
+                    "Step returned no frame for %s (attempt %d/%d); retrying in %.1fs",
+                    action.name,
+                    attempt,
+                    attempts,
+                    delay,
+                )
+                time.sleep(delay)
         return self._convert_raw_frame_data(raw)
 
     def _convert_raw_frame_data(self, raw: FrameDataRaw | None) -> FrameData:
@@ -150,6 +169,7 @@ class Agent(ABC):
             state=raw.state,
             levels_completed=raw.levels_completed,
             win_levels=raw.win_levels,
+            action_input=raw.action_input,
             guid=raw.guid,
             full_reset=raw.full_reset,
             available_actions=raw.available_actions,
