@@ -712,26 +712,27 @@ def test_fixture_experiment_requires_same_appearance_evidence_and_abstains_on_mi
 
 
 def test_nonlocal_arrival_cell_suppresses_geometric_from_different_edges():
-    """After observing edge A is nonlocal, edge B targeting same arrival returns relocation."""
+    """After observing edge A is nonlocal, only that exact edge is affected, not all arrivals."""
     controller, observation, clock, memory, _, _ = fixture()
 
-    # Mark edge (7,3)+ACTION4 as known nonlocal relocating to (6,3)
+    # Mark edge (7,3)+ACTION4 as known nonlocal with destination
     # Its geometric target would be (7+1, 3) = (8, 3)
     controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
     controller.nonlocal_edge_destinations = {((7, 3), "ACTION4"): (6, 3)}
 
     model = EntityOptionModel(controller, observation, clock, memory, {})
 
-    # Create a node at (8, 2) with the same status context
-    node_at_8_2 = replace(
-        model.bind(observation, clock),
-        player=(8, 2),
-    )
+    # The EXACT edge (7,3)+ACTION4 returns its relocation destination
+    node_at_7_3 = replace(model.bind(observation, clock), player=(7, 3))
+    movement_exact = model.movement(node_at_7_3, "ACTION4")
+    assert movement_exact == ((6, 3), "nonlocal_edge_relocation")
 
-    # ACTION2 from (8,2) would geometrically target (8, 2+1) = (8, 3)
-    # Should return relocation to (6,3) because (8,3) is a nonlocal arrival
-    movement = model.movement(node_at_8_2, "ACTION2")
-    assert movement == ((6, 3), "nonlocal_arrival_relocation")
+    # But OTHER approaches to (8,3) can still use geometric navigation
+    # because we don't over-generalize to all arrivals
+    node_at_8_2 = replace(model.bind(observation, clock), player=(8, 2))
+    movement_other = model.movement(node_at_8_2, "ACTION2")
+    if (8, 3) in model.projection:
+        assert movement_other == ((8, 3), "geometric_navigation_projection")
 
 
 def test_nonlocal_arrival_suppression_only_blocks_geometric_not_contextual():
@@ -766,51 +767,57 @@ def test_nonlocal_arrival_suppression_only_blocks_geometric_not_contextual():
 
 
 def test_multiple_nonlocal_edges_accumulate_suppressed_arrivals():
-    """Multiple nonlocal edges create multiple arrival relocations."""
+    """Multiple nonlocal edges with destinations return their relocations."""
     controller, observation, clock, memory, _, _ = fixture()
 
-    # Mark two different nonlocal edges with different geometric targets
-    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))  # targets (8, 3) → (6, 3)
-    controller.known_nonlocal_edges.add(((7, 4), "ACTION4"))  # targets (8, 4) → (6, 4)
+    # Mark two different nonlocal edges with different geometric targets and destinations
+    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))  # relocates to (6, 3)
+    controller.known_nonlocal_edges.add(((5, 5), "ACTION2"))  # relocates to (4, 5)
     controller.nonlocal_edge_destinations = {
         ((7, 3), "ACTION4"): (6, 3),
-        ((7, 4), "ACTION4"): (6, 4),
+        ((5, 5), "ACTION2"): (4, 5),
     }
 
     model = EntityOptionModel(controller, observation, clock, memory, {})
 
-    # Both arrival cells should be in the relocation map
-    assert (8, 3) in model.nonlocal_arrival_destinations
-    assert (8, 4) in model.nonlocal_arrival_destinations
+    # Each EXACT edge returns its relocation destination
+    node_at_7_3 = replace(model.bind(observation, clock), player=(7, 3))
+    assert model.movement(node_at_7_3, "ACTION4") == ((6, 3), "nonlocal_edge_relocation")
 
-    # Verify the mapping creates two distinct relocations
-    assert model.nonlocal_arrival_destinations[(8, 3)] == (6, 3)
-    assert model.nonlocal_arrival_destinations[(8, 4)] == (6, 4)
+    node_at_5_5 = replace(model.bind(observation, clock), player=(5, 5))
+    assert model.movement(node_at_5_5, "ACTION2") == ((4, 5), "nonlocal_edge_relocation")
+
+    # But other approaches to those targets can use geometric navigation
+    node_at_8_2 = replace(model.bind(observation, clock), player=(8, 2))
+    if (8, 3) in model.projection:
+        assert model.movement(node_at_8_2, "ACTION2") == (
+            (8, 3),
+            "geometric_navigation_projection",
+        )
 
 
 def test_arrival_suppression_does_not_affect_other_directions():
-    """Arrival relocation only affects edges geometrically targeting that arrival cell."""
+    """Exact-edge suppression only affects that specific edge, not other approaches."""
     controller, observation, clock, memory, _, _ = fixture()
 
-    # Mark edge (7,3)+ACTION4 as nonlocal (geometric target is (8, 3) → (6, 3))
+    # Mark edge (7,3)+ACTION4 as nonlocal with destination
     controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
     controller.nonlocal_edge_destinations = {((7, 3), "ACTION4"): (6, 3)}
 
     model = EntityOptionModel(controller, observation, clock, memory, {})
 
-    # Create a node at (8, 4) - different Y coordinate
-    node_at_8_4 = replace(
-        model.bind(observation, clock),
-        player=(8, 4),
-    )
+    # The exact edge (7,3)+ACTION4 returns its relocation
+    node_at_7_3 = replace(model.bind(observation, clock), player=(7, 3))
+    assert model.movement(node_at_7_3, "ACTION4") == ((6, 3), "nonlocal_edge_relocation")
 
-    # ACTION1 from (8,4) would geometrically target (8, 3) which relocates to (6,3)
-    movement_up = model.movement(node_at_8_4, "ACTION1")
-    assert movement_up == ((6, 3), "nonlocal_arrival_relocation")
+    # But OTHER approaches to (8,3) can use geometric if not observed nonlocal
+    node_at_8_4 = replace(model.bind(observation, clock), player=(8, 4))
+    if (8, 3) in model.projection:
+        movement_to_target = model.movement(node_at_8_4, "ACTION1")
+        assert movement_to_target == ((8, 3), "geometric_navigation_projection")
 
-    # But ACTION3 from (8,4) would target (7, 4) which should still work geometrically
+    # And unrelated directions still work normally
     movement_left = model.movement(node_at_8_4, "ACTION3")
-    # Should work if (7,4) is in projection
     if (7, 4) in model.projection:
         assert movement_left is not None
         assert movement_left[0] == (7, 4)
@@ -894,101 +901,92 @@ def test_fixture_experiment_still_runs_when_goal_search_finds_nothing():
 
 
 def test_nonlocal_arrival_returns_relocation_destination_not_none():
-    """When geometric target is a known nonlocal arrival, return relocation destination."""
+    """EXACT observed nonlocal edges return their learned destinations."""
     controller, observation, clock, memory, _, _ = fixture()
 
-    # Set up: (7,3)+ACTION4 relocates to (6,3), so (8,3) is a portal to (6,3)
+    # Mark (7,3)+ACTION4 as nonlocal with known destination (6,3)
     controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
     controller.nonlocal_edge_destinations = {((7, 3), "ACTION4"): (6, 3)}
 
     model = EntityOptionModel(controller, observation, clock, memory, {})
 
-    # From (8,2), ACTION2 would geometrically target (8,3)
-    node_at_8_2 = replace(model.bind(observation, clock), player=(8, 2))
-    movement = model.movement(node_at_8_2, "ACTION2")
+    # From (7,3), ACTION4 should return the learned relocation destination
+    node_at_7_3 = replace(model.bind(observation, clock), player=(7, 3))
+    movement = model.movement(node_at_7_3, "ACTION4")
 
-    # Should return (6,3) with nonlocal_arrival_relocation label, not None
     assert movement is not None
     assert movement[0] == (6, 3)
-    assert movement[1] == "nonlocal_arrival_relocation"
+    assert movement[1] == "nonlocal_edge_relocation"
 
 
 def test_nonlocal_arrival_relocation_works_for_multiple_edges_same_destination():
-    """Multiple edges to same arrival with same destination create a relay."""
+    """Other edges targeting the same cell can still use geometric navigation."""
     controller, observation, clock, memory, _, _ = fixture()
 
-    # Both (7,3)+ACTION4 and (8,2)+ACTION2 target (8,3) and relocate to (6,3)
-    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
-    controller.known_nonlocal_edges.add(((8, 2), "ACTION2"))
-    controller.nonlocal_edge_destinations = {
-        ((7, 3), "ACTION4"): (6, 3),
-        ((8, 2), "ACTION2"): (6, 3),
-    }
-
-    model = EntityOptionModel(controller, observation, clock, memory, {})
-
-    # (8,3) should be in nonlocal_arrival_destinations mapping to (6,3)
-    assert (8, 3) in model.nonlocal_arrival_destinations
-    assert model.nonlocal_arrival_destinations[(8, 3)] == (6, 3)
-
-    # Different approach to (8,3) from (8,4) should use arrival relocation
-    node_at_8_4 = replace(model.bind(observation, clock), player=(8, 4))
-    movement = model.movement(node_at_8_4, "ACTION1")  # ACTION1 from (8,4) targets (8,3)
-    assert movement == ((6, 3), "nonlocal_arrival_relocation")
-
-
-def test_conflicting_arrival_destinations_blocked():
-    """If multiple edges target same arrival with different destinations, block it."""
-    controller, observation, clock, memory, _, _ = fixture()
-
-    # Conflicting: (7,3)+ACTION4 → (8,3) → (6,3) but (8,2)+ACTION2 → (8,3) → (5,3)
-    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
-    controller.known_nonlocal_edges.add(((8, 2), "ACTION2"))
-    controller.nonlocal_edge_destinations = {
-        ((7, 3), "ACTION4"): (6, 3),
-        ((8, 2), "ACTION2"): (5, 3),  # Different destination!
-    }
-
-    model = EntityOptionModel(controller, observation, clock, memory, {})
-
-    # (8,3) is ambiguous - should not be in nonlocal_arrival_destinations
-    assert (8, 3) not in model.nonlocal_arrival_destinations
-
-    # Movement targeting (8,3) should return None (no unique destination)
-    node = replace(model.bind(observation, clock), player=(8, 2))
-    assert model.movement(node, "ACTION2") is None
-
-
-def test_step_allows_nonlocal_arrival_relocation_label():
-    """step() accepts nonlocal_arrival_relocation as valid nonlocal movement."""
-    controller, observation, clock, memory, _, _ = fixture()
-
-    # Set up arrival relocation
+    # Only (7,3)+ACTION4 is observed nonlocal, not all approaches to (8,3)
     controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
     controller.nonlocal_edge_destinations = {((7, 3), "ACTION4"): (6, 3)}
 
     model = EntityOptionModel(controller, observation, clock, memory, {})
-    node = replace(model.bind(observation, clock), player=(8, 2))
 
-    # step() should accept the nonlocal arrival relocation
-    step = model.step(node, "ACTION2")
+    # From (8,4), ACTION1 targets (8,3) but hasn't been observed nonlocal
+    # Should use geometric navigation if (8,3) is in projection
+    node_at_8_4 = replace(model.bind(observation, clock), player=(8, 4))
+    movement = model.movement(node_at_8_4, "ACTION1")
+
+    if (8, 3) in model.projection:
+        assert movement is not None
+        assert movement[0] == (8, 3)
+        assert movement[1] == "geometric_navigation_projection"
+
+
+def test_conflicting_arrival_destinations_blocked():
+    """Nonlocal edges without known destinations are still suppressed."""
+    controller, observation, clock, memory, _, _ = fixture()
+
+    # Mark edge as nonlocal but don't provide destination
+    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
+    # No destination in nonlocal_edge_destinations
+
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+
+    node_at_7_3 = replace(model.bind(observation, clock), player=(7, 3))
+    movement = model.movement(node_at_7_3, "ACTION4")
+
+    # Should return None (edge known nonlocal but destination unknown)
+    assert movement is None
+
+
+def test_step_allows_nonlocal_arrival_relocation_label():
+    """step() accepts nonlocal_edge_relocation as valid nonlocal movement."""
+    controller, observation, clock, memory, _, _ = fixture()
+
+    # Set up exact edge relocation
+    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
+    controller.nonlocal_edge_destinations = {((7, 3), "ACTION4"): (6, 3)}
+
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+    node = replace(model.bind(observation, clock), player=(7, 3))
+
+    # step() should accept the nonlocal edge relocation
+    step = model.step(node, "ACTION4")
     assert step is not None
     assert step.after.player == (6, 3)
-    assert "nonlocal_arrival_relocation" in step.hypotheses
+    assert "nonlocal_edge_relocation" in step.hypotheses
 
 
 def test_contextual_special_transition_still_wins_over_arrival_relocation():
-    """Exact contextual special transitions take precedence over arrival relocations."""
+    """Exact contextual special transitions take precedence over edge relocations."""
     controller, observation, clock, memory, _, _ = fixture()
 
     pattern = ((1, 0, 1), (1, 1, 0), (0, 1, 1))
     observation = replace(observation, status_pattern=pattern)
 
-    # Arrival relocation: (8,3) → (6,3) generically
+    # Generic edge relocation: (7,3)+ACTION4 → (6,3)
     controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
     controller.nonlocal_edge_destinations = {((7, 3), "ACTION4"): (6, 3)}
 
-    # But contextual special transition from (7,3) in this specific context goes to (5,3)
+    # But contextual special transition in this specific context goes to (5,3)
     controller.special_transitions = {
         ((7, 3), "ACTION4", pattern, observation.status_color): (5, 3)
     }
@@ -999,8 +997,3 @@ def test_contextual_special_transition_still_wins_over_arrival_relocation():
     # Contextual special should win
     movement = model.movement(node, "ACTION4")
     assert movement == ((5, 3), "contextual_special_transition")
-
-    # From different cell targeting same arrival, use arrival relocation
-    node2 = replace(model.bind(observation, clock), player=(8, 2))
-    movement2 = model.movement(node2, "ACTION2")
-    assert movement2 == ((6, 3), "nonlocal_arrival_relocation")

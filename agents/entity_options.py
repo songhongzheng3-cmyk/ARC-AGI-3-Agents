@@ -93,31 +93,10 @@ class EntityOptionModel:
         self.failures = set(controller.bad_edges)
         self.rejected_entries = set(controller.rejected_entries)
         # Store edges known to be non-local (from MechanismPolicy.special_transitions)
+        # Model ONLY exact observed edges as relocations, not all approaches to an arrival.
         self.known_nonlocal_edges = set(controller.known_nonlocal_edges)
         # Store the edge→destination mapping for nonlocal edges
         self.nonlocal_edge_destinations = dict(controller.nonlocal_edge_destinations)
-        # Derive arrival cells and their relocation destinations
-        # These are cells that geometric projection would target, but actually
-        # cause relocation. Map arrival cell → observed relocation destination.
-        self.nonlocal_arrival_destinations = {}
-        for (cell, action), destination in self.nonlocal_edge_destinations.items():
-            arrival = (cell[0] + ACTION_DELTAS[action][0], cell[1] + ACTION_DELTAS[action][1])
-            # If multiple edges target the same arrival with different destinations,
-            # we can't predict uniquely - skip modeling that arrival as a relay
-            if arrival in self.nonlocal_arrival_destinations:
-                if self.nonlocal_arrival_destinations[arrival] != destination:
-                    # Conflicting destinations for same arrival - remove it
-                    self.nonlocal_arrival_destinations[arrival] = None
-            else:
-                self.nonlocal_arrival_destinations[arrival] = destination
-        # Remove conflicting entries
-        self.nonlocal_arrival_destinations = {
-            arrival: dest
-            for arrival, dest in self.nonlocal_arrival_destinations.items()
-            if dest is not None
-        }
-        # Keep set of arrivals for backward compatibility
-        self.known_nonlocal_arrivals = set(self.nonlocal_arrival_destinations.keys())
         # Convert MechanismPolicy contextual_special_transitions keys from
         # (cell, action, signature_string, color) to (cell, action, Pattern, color)
         self.special_transitions = {}
@@ -224,11 +203,14 @@ class EntityOptionModel:
             destination = self.special_transitions[contextual_key]
             return destination, "contextual_special_transition"
 
-        # Suppress geometric projection on edges known to be non-local relocations.
-        # MechanismPolicy.special_transitions records edges where geometric motion
-        # is wrong. Do not fall back to geometric; return None to force exploration
-        # or wait for contextual special transition to be learned.
+        # Model exact observed nonlocal edges as relocations when destination is known.
+        # This allows search to plan through observed portals/teleporters using their
+        # learned destinations, without over-generalizing to all approaches to the arrival.
         if edge in self.known_nonlocal_edges:
+            destination = self.nonlocal_edge_destinations.get(edge)
+            if destination is not None:
+                return destination, "nonlocal_edge_relocation"
+            # Edge known nonlocal but destination unknown - suppress geometric
             return None
 
         # Only reject as bad edge if no special transition exists
@@ -261,14 +243,6 @@ class EntityOptionModel:
                 return (next(iter(outputs)), label) if len(outputs) == 1 else None
         dx, dy = ACTION_DELTAS[action]
         target = node.player[0] + dx, node.player[1] + dy
-        # When the geometric target is a known nonlocal arrival (portal/teleporter),
-        # return the observed relocation destination instead of blocking navigation.
-        # This models the arrival as a searchable transport edge to the observed
-        # destination, avoiding second-contact prediction errors while making goals
-        # beyond the portal reachable through the relocation.
-        if target in self.nonlocal_arrival_destinations:
-            destination = self.nonlocal_arrival_destinations[target]
-            return destination, "nonlocal_arrival_relocation"
         if target in self.projection or target in self.targets:
             return target, "geometric_navigation_projection"
         return None
@@ -296,7 +270,7 @@ class EntityOptionModel:
         ) in self.rejected_entries and label not in (
             "observed_navigation_context",
             "contextual_special_transition",
-            "nonlocal_arrival_relocation",
+            "nonlocal_edge_relocation",
         ):
             # Quarantine an unsupported arrival hypothesis across approaches;
             # this is abstention, not a learned universal gate/teleport rule.
@@ -304,8 +278,9 @@ class EntityOptionModel:
         dx, dy = ACTION_DELTAS[action]
         if target not in {node.player, (node.player[0] + dx, node.player[1] + dy)}:
             # Nonlocal transitions can use a different entity clock, but allow
-            # them when backed by consistent observations or arrival relocations.
-            if label not in ("contextual_special_transition", "nonlocal_arrival_relocation"):
+            # them when backed by a consistent contextual special transition or
+            # exact observed nonlocal edge relocation.
+            if label not in ("contextual_special_transition", "nonlocal_edge_relocation"):
                 return None
         moved = target != node.player
         fixtures = [(cell, sig) for cell, sig in node.fixtures if cell == target]
