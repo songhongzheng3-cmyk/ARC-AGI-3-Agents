@@ -1,5 +1,7 @@
 # Searchable Relocation Navigation Contracts (2026-11-04)
 
+**Status: FIXED (signature→Pattern key conversion added)**
+
 ## Scope
 
 Implement searchable navigation contracts for verified non-local/relocation transitions in entity_options planning to unblock StructuredAgent on ls20 level 6, without relaxing state keys or hard-coding level-specific coordinates.
@@ -68,22 +70,40 @@ Added 5 comprehensive unit tests in `tests/unit/test_entity_options.py`:
 
 ## Reproducibility
 
-To reproduce offline:
+### Unit Tests
 
 ```bash
-# Run full test suite
+# Run full test suite (425/425 pass)
 uv run pytest tests/unit/ -v
 
-# Run only new special transition tests
+# Run only new special transition tests (6 tests)
 uv run pytest tests/unit/test_entity_options.py::test_contextual_special_transition_allows_nonlocal_movement \
   tests/unit/test_entity_options.py::test_contextual_special_transition_overrides_geometric_navigation \
   tests/unit/test_entity_options.py::test_special_transition_rejected_for_wrong_status_context \
   tests/unit/test_entity_options.py::test_special_transition_rejected_for_wrong_color_context \
-  tests/unit/test_entity_options.py::test_special_transition_works_in_goal_search -v
+  tests/unit/test_entity_options.py::test_special_transition_works_in_goal_search \
+  tests/unit/test_entity_options.py::test_mechanism_policy_signature_keys_converted_to_pattern -v
 
 # Check linting
 uv run ruff check agents/entity_options.py agents/mechanism_policy.py tests/unit/test_entity_options.py
 ```
+
+### Checkpoint Validation (if validation script exists)
+
+To verify special transitions appear in entity_options hypotheses after the fix:
+
+```bash
+# Validate from checkpoint with special transitions
+uv run python scripts/validate_entity_options.py --freeze-row 620 \
+  --max-new-actions 120 --max-prediction-errors 3
+
+# Look for:
+# - hypotheses including "contextual_special_transition"
+# - Non-zero count of executed steps using special transitions
+# - Reduced first_prediction_mismatch vs baseline
+```
+
+If `scripts/validate_entity_options.py` does not exist, checkpoint validation must be performed through the main agent with checkpoint restore functionality.
 
 ## Level 6 Status
 
@@ -111,13 +131,54 @@ Original hypothesis: "entity-options prediction / bad_edge invalidation may be a
 - `contextual_special_transitions` existed in MechanismPolicy but weren't passed to entity_options
 - Solution: pass special transitions and allow non-local when backed by consistent observations
 
+## Post-Merge Fix (2026-11-04)
+
+### Bug Identified in Live Testing
+
+After merging PR #2, checkpoint validation revealed **0 executed steps used hypothesis `contextual_special_transition`**. First mismatch still expected geometric (8,3), actual (6,3).
+
+**Root cause**: Type mismatch in dictionary keys:
+- `MechanismPolicy.contextual_special_transitions` keys use `state.status_signature` (string like `"101/110/011"`)
+- `EntityOptionModel.movement()` looked up `(node.player, action, node.pattern, node.color)` where `node.pattern` is a `Pattern` (nested tuples)
+- Keys never matched; planning kept using geometric projections
+
+### Fix Applied
+
+Added signature→Pattern conversion in `EntityOptionModel.__init__()`:
+
+```python
+def _signature_to_pattern(signature: str) -> Pattern:
+    """Convert status signature string to Pattern tuple structure."""
+    if signature == "empty":
+        return ()
+    return tuple(
+        tuple(int(value) for value in row)
+        for row in signature.split("/")
+        if row
+    )
+```
+
+The model now converts all incoming keys from signature strings to Pattern tuples, supporting both:
+- Real MechanismPolicy keys (signature strings)
+- Test keys (Pattern tuples, for backward compatibility)
+
+### Integration Test Added
+
+`test_mechanism_policy_signature_keys_converted_to_pattern()` verifies:
+- MechanismPolicy-shaped keys (signature strings) are accepted
+- EntityOptionModel converts them to Pattern tuples
+- `movement()` and `step()` correctly return `"contextual_special_transition"`
+- Original signature keys are not retained in model's dict
+
+This test would have caught the original bug.
+
 ## Files Changed
 
-- `agents/entity_options.py` (+20 lines: dict field, movement check, step condition)
+- `agents/entity_options.py` (+33 lines: signature converter, key conversion logic, movement check, step condition)
 - `agents/mechanism_policy.py` (+1 line: pass special_transitions)
-- `tests/unit/test_entity_options.py` (+87 lines: 5 new tests)
+- `tests/unit/test_entity_options.py` (+106 lines: 6 new tests including integration test)
 
-**Git diff**: 3 files changed, 108 insertions(+), 3 deletions(-)
+**Git diff**: 2 files changed, 140 insertions(+), 2 deletions(-)
 
 ## Open Questions
 

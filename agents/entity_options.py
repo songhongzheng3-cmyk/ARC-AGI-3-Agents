@@ -18,6 +18,17 @@ from .mechanism_state_tracker import ACTION_DELTAS, Cell, Pattern
 from .motion_context import MotionContextMemory, ObjectSignature
 
 
+def _signature_to_pattern(signature: str) -> Pattern:
+    """Convert status signature string to Pattern tuple structure."""
+    if signature == "empty":
+        return ()
+    return tuple(
+        tuple(int(value) for value in row)
+        for row in signature.split("/")
+        if row
+    )
+
+
 @dataclass(frozen=True)
 class EntityNode:
     player: Cell
@@ -83,7 +94,16 @@ class EntityOptionModel:
         self.refill_signatures = deepcopy(controller.refill_signatures)
         self.failures = set(controller.bad_edges)
         self.rejected_entries = set(controller.rejected_entries)
-        self.special_transitions = dict(controller.special_transitions)
+        # Convert MechanismPolicy contextual_special_transitions keys from
+        # (cell, action, signature_string, color) to (cell, action, Pattern, color)
+        self.special_transitions = {}
+        for (cell, action, pattern_or_sig, color), dest in controller.special_transitions.items():
+            # Handle both Pattern tuples (from tests) and signature strings (from MechanismPolicy)
+            if isinstance(pattern_or_sig, str):
+                pattern = _signature_to_pattern(pattern_or_sig)
+            else:
+                pattern = pattern_or_sig
+            self.special_transitions[(cell, action, pattern, color)] = dest
         self.atomic = defaultdict(set)
         for (
             before,
