@@ -812,3 +812,180 @@ def test_arrival_suppression_does_not_affect_other_directions():
         assert movement_left is not None
         assert movement_left[0] == (7, 4)
         assert movement_left[1] == "geometric_navigation_projection"
+
+
+def test_hypothesis_usage_tracking():
+    """Test that executed step hypotheses are tracked in diagnostics."""
+    controller, observation, clock, memory, _effects, _ = fixture()
+
+    # Set up a simple goal at (9, 6)
+    pattern = ((1, 0, 1), (1, 1, 0), (0, 1, 1))
+    observation = replace(observation, status_pattern=pattern)
+    targets = {(9, 6): (observation.status_pattern, observation.status_color)}
+
+    # Create a plan that will execute a step
+    model = EntityOptionModel(controller, observation, clock, memory, targets)
+    start = model.bind(observation, clock)
+    assert start is not None
+
+    # Get a step that we can execute
+    step = model.step(start, "ACTION4")
+    assert step is not None
+    assert len(step.hypotheses) > 0
+
+    # Set up previous state
+    controller.observe(observation, clock, None)
+
+    # Install a plan with this step
+    controller._install(model, [step])
+
+    # Initially, hypothesis_usage should be empty
+    diagnostics = controller.diagnostics()
+    assert diagnostics["hypothesis_usage"] == {}
+
+    # Simulate execution: observe with matching state
+    next_observation = replace(
+        observation,
+        player_position=step.after.player,
+        status_pattern=step.after.pattern,
+        status_color=step.after.color,
+        resource_level=step.after.resource,
+    )
+
+    # Execute the step (use dynamic(1) to advance phases)
+    from tests.unit.test_entity_options import dynamic
+    controller.observe(next_observation, dynamic(1), step.action)
+
+    # Now hypothesis_usage should contain the step's hypotheses
+    diagnostics = controller.diagnostics()
+    assert diagnostics["hypothesis_usage"] != {}
+    for hypothesis in step.hypotheses:
+        assert hypothesis in diagnostics["hypothesis_usage"]
+        assert diagnostics["hypothesis_usage"][hypothesis] >= 1
+
+
+def test_hypothesis_usage_counts_multiple_executions():
+    """Test that hypothesis usage accumulates across multiple step executions."""
+    controller, observation, clock, memory, _effects, _ = fixture()
+
+    pattern = ((1, 0, 1), (1, 1, 0), (0, 1, 1))
+    observation = replace(observation, status_pattern=pattern)
+
+    # Set up a multi-step plan
+    targets = {(6, 6): (observation.status_pattern, observation.status_color)}
+    model = EntityOptionModel(controller, observation, clock, memory, targets)
+    start = model.bind(observation, clock)
+
+    # Build a path with multiple steps
+    steps = []
+    node = start
+    for action in ["ACTION4", "ACTION4", "ACTION1"]:
+        step = model.step(node, action)
+        if step is None:
+            break
+        steps.append(step)
+        node = replace(step.after, phases=step.after.phases)
+
+    assert len(steps) >= 3
+
+    # Set up previous state
+    controller.observe(observation, clock, None)
+
+    # Execute the steps one by one
+    from tests.unit.test_entity_options import dynamic
+    for i, step in enumerate(steps):
+        controller._install(model, [step])
+
+        next_observation = replace(
+            observation,
+            player_position=step.after.player,
+            status_pattern=step.after.pattern,
+            status_color=step.after.color,
+            resource_level=step.after.resource,
+        )
+
+        controller.observe(next_observation, dynamic(i + 1), step.action)
+        observation = next_observation
+
+    # Check that counts accumulated
+    diagnostics = controller.diagnostics()
+    total_usage = sum(diagnostics["hypothesis_usage"].values())
+    assert total_usage >= 3  # At least 3 hypotheses tracked (1 per step minimum)
+
+
+def test_hypothesis_usage_includes_contextual_special_transition():
+    """Test that contextual_special_transition hypothesis is tracked when used."""
+    controller, observation, clock, memory, _effects, _ = fixture()
+
+    # Set up a contextual special transition
+    pattern = ((1, 0, 1), (1, 1, 0), (0, 1, 1))
+    observation = replace(observation, status_pattern=pattern, player_position=(7, 3))
+    special_transitions = {
+        ((7, 3), "ACTION4", observation.status_pattern, observation.status_color): (6, 3)
+    }
+    controller.special_transitions = special_transitions
+
+    # Create a model and get a step using the special transition
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+    start = model.bind(observation, clock)
+    assert start is not None
+
+    # Get a step using the special transition (start.player should be (7, 3))
+    step = model.step(start, "ACTION4")
+    assert step is not None
+    assert "contextual_special_transition" in step.hypotheses
+
+    # Set up previous state
+    controller.observe(observation, clock, None)
+
+    # Install and execute the step
+    controller._install(model, [step])
+
+    next_observation = replace(
+        observation,
+        player_position=(6, 3),  # Special transition destination
+        resource_level=step.after.resource,
+    )
+
+    from tests.unit.test_entity_options import dynamic
+    controller.observe(next_observation, dynamic(1), "ACTION4")
+
+    # Verify contextual_special_transition was tracked
+    diagnostics = controller.diagnostics()
+    assert "contextual_special_transition" in diagnostics["hypothesis_usage"]
+    assert diagnostics["hypothesis_usage"]["contextual_special_transition"] >= 1
+
+
+def test_hypothesis_usage_not_tracked_on_mismatch():
+    """Test that hypotheses are not tracked when prediction mismatches."""
+    controller, observation, clock, memory, _effects, _ = fixture()
+
+    pattern = ((1, 0, 1), (1, 1, 0), (0, 1, 1))
+    observation = replace(observation, status_pattern=pattern)
+    targets = {(9, 6): (observation.status_pattern, observation.status_color)}
+
+    model = EntityOptionModel(controller, observation, clock, memory, targets)
+    start = model.bind(observation, clock)
+    assert start is not None
+
+    step = model.step(start, "ACTION4")
+    assert step is not None
+
+    # Set up previous state
+    controller.observe(observation, clock, None)
+
+    controller._install(model, [step])
+
+    # Observe with MISMATCHED state (wrong player position)
+    wrong_observation = replace(
+        observation,
+        player_position=(99, 99),  # Wrong position
+        resource_level=step.after.resource,
+    )
+
+    from tests.unit.test_entity_options import dynamic
+    controller.observe(wrong_observation, dynamic(1), step.action)
+
+    # Hypothesis usage should still be empty because the prediction failed
+    diagnostics = controller.diagnostics()
+    assert diagnostics["hypothesis_usage"] == {}

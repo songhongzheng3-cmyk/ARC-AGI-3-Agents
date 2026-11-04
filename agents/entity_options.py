@@ -553,6 +553,7 @@ class EntityOptionController:
         self.attempts = Counter()
         self.fixture_attempts = Counter()
         self.metrics = Counter()
+        self.hypothesis_usage = Counter()
         self.failures = []
         self.model = None
         self.expected = None
@@ -683,6 +684,8 @@ class EntityOptionController:
                 self.reacquire = None
             else:
                 self.metrics["validated_steps"] += 1
+                for hypothesis in expected.hypotheses:
+                    self.hypothesis_usage[hypothesis] += 1
                 if expected.unknown_fields:
                     self.metrics["experimental_outcomes"] += 1
                 if expected.fixture is not None:
@@ -813,6 +816,7 @@ class EntityOptionController:
     def diagnostics(self):
         return {
             "metrics": dict(self.metrics),
+            "hypothesis_usage": dict(self.hypothesis_usage),
             "failures": self.failures,
             "attempts": [
                 {"key": key, "count": count} for key, count in self.attempts.items()
