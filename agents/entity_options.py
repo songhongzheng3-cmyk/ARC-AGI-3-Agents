@@ -755,18 +755,6 @@ class EntityOptionController:
         start = model.bind(state, dynamic)
         if start is None:
             return None
-        if (
-            self.rejected_entries
-            and sum(self.fixture_attempts.values()) < self.MAX_FIXTURE_EXPERIMENTS
-        ):
-            path, expanded = model.search_fixture_experiment(
-                start, names, self.fixture_attempts
-            )
-            self.metrics["fixture_searches"] += 1
-            self.metrics["fixture_expanded"] += expanded
-            if path:
-                self.objective = "test_visible_fixture_after_navigation_failure"
-                return self._install(model, path)
         if self.reacquire is not None:
             visible = MotionContextMemory.visible_positions(state)
             if self.reacquire in visible:
@@ -786,6 +774,18 @@ class EntityOptionController:
             self.metrics["goal_expanded"] += expanded
             if path:
                 self.objective = "execute_entity_goal_option"
+                return self._install(model, path)
+        if (
+            self.rejected_entries
+            and sum(self.fixture_attempts.values()) < self.MAX_FIXTURE_EXPERIMENTS
+        ):
+            path, expanded = model.search_fixture_experiment(
+                start, names, self.fixture_attempts
+            )
+            self.metrics["fixture_searches"] += 1
+            self.metrics["fixture_expanded"] += expanded
+            if path:
+                self.objective = "test_visible_fixture_after_navigation_failure"
                 return self._install(model, path)
         if (
             self.tick < self.next_experiment
