@@ -94,6 +94,9 @@ class EntityOptionModel:
         self.refill_signatures = deepcopy(controller.refill_signatures)
         self.failures = set(controller.bad_edges)
         self.rejected_entries = set(controller.rejected_entries)
+        # Store edges known to be non-local (from MechanismPolicy.special_transitions)
+        # to suppress geometric projection on first contact
+        self.known_nonlocal_edges = set(controller.known_nonlocal_edges)
         # Convert MechanismPolicy contextual_special_transitions keys from
         # (cell, action, signature_string, color) to (cell, action, Pattern, color)
         self.special_transitions = {}
@@ -194,6 +197,13 @@ class EntityOptionModel:
         if contextual_key in self.special_transitions:
             destination = self.special_transitions[contextual_key]
             return destination, "contextual_special_transition"
+
+        # Suppress geometric projection on edges known to be non-local relocations.
+        # MechanismPolicy.special_transitions records edges where geometric motion
+        # is wrong. Do not fall back to geometric; return None to force exploration
+        # or wait for contextual special transition to be learned.
+        if edge in self.known_nonlocal_edges:
+            return None
 
         # Only reject as bad edge if no special transition exists
         if edge in self.failures:
@@ -522,6 +532,7 @@ class EntityOptionController:
         self.bad_edges = set()
         self.rejected_entries = set()
         self.special_transitions = {}
+        self.known_nonlocal_edges = set()
         self.attempts = Counter()
         self.fixture_attempts = Counter()
         self.metrics = Counter()
@@ -677,10 +688,21 @@ class EntityOptionController:
         self.previous_phases = phases
         self.previous_signatures = signatures
 
-    def choose(self, state, dynamic, effects, targets, names, special_transitions=None):
+    def choose(
+        self,
+        state,
+        dynamic,
+        effects,
+        targets,
+        names,
+        special_transitions=None,
+        known_nonlocal_edges=None,
+    ):
         names = tuple(n for n in names if n in ACTION_DELTAS)
         if special_transitions is not None:
             self.special_transitions = special_transitions
+        if known_nonlocal_edges is not None:
+            self.known_nonlocal_edges = known_nonlocal_edges
         if self.metrics["steps_selected"] >= self.MAX_STEPS:
             if self.model is not None:
                 self.invalidate("action_budget")

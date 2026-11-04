@@ -429,6 +429,104 @@ def test_learned_special_transition_overrides_bad_edge_after_mismatch():
     assert any("contextual_special_transition" in step.hypotheses for step in path)
 
 
+def test_relocation_learned_in_context_c1_usable_under_c1():
+    """After observing (c,a) relocate under C1, planning under C1 uses it."""
+    from agents.mechanism_state_tracker import pattern_key
+
+    controller, observation, clock, memory, _, _ = fixture()
+    signature_str = pattern_key(PATTERN)
+
+    # Observe (3,3)+ACTION4 relocates to (6,3) under pattern=PATTERN, color=14
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", signature_str, 14): (6, 3),
+    }
+    # Mark edge as known non-local
+    controller.known_nonlocal_edges.add(((3, 3), "ACTION4"))
+
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+    start = model.bind(observation, clock)
+
+    # Planning under same context C1 (PATTERN, 14) should return contextual_special_transition
+    assert start.pattern == PATTERN
+    assert start.color == 14
+    movement = model.movement(start, "ACTION4")
+    assert movement is not None
+    assert movement == ((6, 3), "contextual_special_transition")
+
+    step = model.step(start, "ACTION4")
+    assert step is not None
+    assert step.after.player == (6, 3)
+    assert "contextual_special_transition" in step.hypotheses
+
+
+def test_relocation_under_c1_suppresses_geometric_under_c2():
+    """After observing (c,a) relocate under C1, different context C2 must not use geometric."""
+    from agents.mechanism_state_tracker import pattern_key
+
+    controller, observation, clock, memory, _, _ = fixture()
+    signature_str = pattern_key(PATTERN)
+
+    # Observe (3,3)+ACTION4 relocates under pattern=PATTERN, color=14
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", signature_str, 14): (6, 3),
+    }
+    # Mark edge as known non-local (MechanismPolicy.special_transitions)
+    controller.known_nonlocal_edges.add(((3, 3), "ACTION4"))
+
+    # Create node with DIFFERENT context C2: different pattern
+    different_pattern = ((1, 0), (0, 1))
+    observation_c2 = replace(
+        observation,
+        status_pattern=different_pattern,
+        status_color=14,  # same color, different pattern
+    )
+    model = EntityOptionModel(controller, observation_c2, clock, memory, {})
+    start_c2 = model.bind(observation_c2, clock)
+
+    # Planning under different context C2 must NOT return geometric
+    assert start_c2.pattern == different_pattern
+    assert start_c2.color == 14
+    movement = model.movement(start_c2, "ACTION4")
+    # Should return None (known non-local, no contextual match), not geometric (4,3)
+    assert movement is None
+
+    # step() should also return None
+    step = model.step(start_c2, "ACTION4")
+    assert step is None
+
+
+def test_goal_beyond_bounce_pad_not_planned_as_geometric_after_observation():
+    """Goal beyond a bounce pad is not planned geometrically through the pad."""
+    from agents.mechanism_state_tracker import pattern_key
+
+    controller, observation, clock, memory, _, _ = fixture()
+    signature_str = pattern_key(PATTERN)
+
+    # Observe bounce pad: (3,3)+ACTION4 relocates to (6,3) under context (PATTERN, 14)
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", signature_str, 14): (6, 3),
+    }
+    controller.known_nonlocal_edges.add(((3, 3), "ACTION4"))
+
+    # Goal is at (4,3) - geometrically adjacent through the bounce pad
+    targets = {(4, 3): (PATTERN, 14)}
+    model = EntityOptionModel(controller, observation, clock, memory, targets)
+    start = model.bind(observation, clock)
+
+    # Search should NOT find a geometric path through the bounce pad
+    path, _ = model.search_goal(start, NAMES, max_expansions=500)
+
+    # Either no path found, or path does not use geometric ACTION4 from (3,3)
+    if path is not None:
+        for step in path:
+            # No step should claim geometric navigation through the bounce pad
+            if step.before.player == (3, 3) and step.action == "ACTION4":
+                assert "geometric" not in step.hypotheses
+                # Should either use contextual_special_transition or not exist
+                if "contextual_special_transition" not in step.hypotheses:
+                    assert False, "Unexpected hypothesis for bounce pad edge"
+
+
 def test_new_evidence_invalidates_retained_plan_before_next_action():
     controller, observation, clock, memory, model, start = fixture()
     controller.model = model

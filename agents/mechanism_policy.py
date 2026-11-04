@@ -3091,6 +3091,7 @@ class MechanismPolicy:
                 },
                 names,
                 special_transitions=self.contextual_special_transitions,
+                known_nonlocal_edges=set(self.special_transitions.keys()),
             )
             if step is not None:
                 self.task_plan_controller.invalidate("entity_option_selected")
