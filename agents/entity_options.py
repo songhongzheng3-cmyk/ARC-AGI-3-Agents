@@ -93,16 +93,31 @@ class EntityOptionModel:
         self.failures = set(controller.bad_edges)
         self.rejected_entries = set(controller.rejected_entries)
         # Store edges known to be non-local (from MechanismPolicy.special_transitions)
-        # to suppress geometric projection on first contact
         self.known_nonlocal_edges = set(controller.known_nonlocal_edges)
-        # Derive arrival cells from known nonlocal edges - these are the cells
-        # that geometric projection would predict as destinations, but which are
-        # actually nonlocal bounce/relocation points. No edge should use geometric
-        # navigation to enter these cells unless backed by a contextual special transition.
-        self.known_nonlocal_arrivals = {
-            (cell[0] + ACTION_DELTAS[action][0], cell[1] + ACTION_DELTAS[action][1])
-            for cell, action in self.known_nonlocal_edges
+        # Store the edge→destination mapping for nonlocal edges
+        self.nonlocal_edge_destinations = dict(controller.nonlocal_edge_destinations)
+        # Derive arrival cells and their relocation destinations
+        # These are cells that geometric projection would target, but actually
+        # cause relocation. Map arrival cell → observed relocation destination.
+        self.nonlocal_arrival_destinations = {}
+        for (cell, action), destination in self.nonlocal_edge_destinations.items():
+            arrival = (cell[0] + ACTION_DELTAS[action][0], cell[1] + ACTION_DELTAS[action][1])
+            # If multiple edges target the same arrival with different destinations,
+            # we can't predict uniquely - skip modeling that arrival as a relay
+            if arrival in self.nonlocal_arrival_destinations:
+                if self.nonlocal_arrival_destinations[arrival] != destination:
+                    # Conflicting destinations for same arrival - remove it
+                    self.nonlocal_arrival_destinations[arrival] = None
+            else:
+                self.nonlocal_arrival_destinations[arrival] = destination
+        # Remove conflicting entries
+        self.nonlocal_arrival_destinations = {
+            arrival: dest
+            for arrival, dest in self.nonlocal_arrival_destinations.items()
+            if dest is not None
         }
+        # Keep set of arrivals for backward compatibility
+        self.known_nonlocal_arrivals = set(self.nonlocal_arrival_destinations.keys())
         # Convert MechanismPolicy contextual_special_transitions keys from
         # (cell, action, signature_string, color) to (cell, action, Pattern, color)
         self.special_transitions = {}
@@ -246,12 +261,14 @@ class EntityOptionModel:
                 return (next(iter(outputs)), label) if len(outputs) == 1 else None
         dx, dy = ACTION_DELTAS[action]
         target = node.player[0] + dx, node.player[1] + dy
-        # Suppress geometric navigation into cells that are known nonlocal arrival points.
-        # Once any edge bouncing from a cell is observed to be nonlocal, no other edge
-        # should use geometric projection to enter that geometric target cell, preventing
-        # prediction errors on different approaches to the same bounce destination.
-        if target in self.known_nonlocal_arrivals:
-            return None
+        # When the geometric target is a known nonlocal arrival (portal/teleporter),
+        # return the observed relocation destination instead of blocking navigation.
+        # This models the arrival as a searchable transport edge to the observed
+        # destination, avoiding second-contact prediction errors while making goals
+        # beyond the portal reachable through the relocation.
+        if target in self.nonlocal_arrival_destinations:
+            destination = self.nonlocal_arrival_destinations[target]
+            return destination, "nonlocal_arrival_relocation"
         if target in self.projection or target in self.targets:
             return target, "geometric_navigation_projection"
         return None
@@ -279,6 +296,7 @@ class EntityOptionModel:
         ) in self.rejected_entries and label not in (
             "observed_navigation_context",
             "contextual_special_transition",
+            "nonlocal_arrival_relocation",
         ):
             # Quarantine an unsupported arrival hypothesis across approaches;
             # this is abstention, not a learned universal gate/teleport rule.
@@ -286,8 +304,8 @@ class EntityOptionModel:
         dx, dy = ACTION_DELTAS[action]
         if target not in {node.player, (node.player[0] + dx, node.player[1] + dy)}:
             # Nonlocal transitions can use a different entity clock, but allow
-            # them when backed by a consistent contextual special transition.
-            if label != "contextual_special_transition":
+            # them when backed by consistent observations or arrival relocations.
+            if label not in ("contextual_special_transition", "nonlocal_arrival_relocation"):
                 return None
         moved = target != node.player
         fixtures = [(cell, sig) for cell, sig in node.fixtures if cell == target]
@@ -550,6 +568,7 @@ class EntityOptionController:
         self.rejected_entries = set()
         self.special_transitions = {}
         self.known_nonlocal_edges = set()
+        self.nonlocal_edge_destinations = {}
         self.attempts = Counter()
         self.fixture_attempts = Counter()
         self.metrics = Counter()
@@ -714,12 +733,15 @@ class EntityOptionController:
         names,
         special_transitions=None,
         known_nonlocal_edges=None,
+        nonlocal_edge_destinations=None,
     ):
         names = tuple(n for n in names if n in ACTION_DELTAS)
         if special_transitions is not None:
             self.special_transitions = special_transitions
         if known_nonlocal_edges is not None:
             self.known_nonlocal_edges = known_nonlocal_edges
+        if nonlocal_edge_destinations is not None:
+            self.nonlocal_edge_destinations = nonlocal_edge_destinations
         if self.metrics["steps_selected"] >= self.MAX_STEPS:
             if self.model is not None:
                 self.invalidate("action_budget")
