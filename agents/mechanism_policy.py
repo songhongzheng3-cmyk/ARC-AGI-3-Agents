@@ -3090,6 +3090,7 @@ class MechanismPolicy:
                     if cell not in self.dynamic_target_cells
                 },
                 names,
+                special_transitions=self.contextual_special_transitions,
             )
             if step is not None:
                 self.task_plan_controller.invalidate("entity_option_selected")
