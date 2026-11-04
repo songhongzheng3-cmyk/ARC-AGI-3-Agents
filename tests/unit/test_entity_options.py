@@ -275,6 +275,93 @@ def test_option_feature_defaults_off_and_reset_retains_configuration():
     assert policy.enable_entity_options
 
 
+def test_contextual_special_transition_allows_nonlocal_movement():
+    """Consistent relocation backed by special transition becomes searchable."""
+    controller, observation, clock, memory, _, _ = fixture()
+    # Record a non-local special transition: (3,3) + ACTION4 -> (6,3)
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", PATTERN, 14): (6, 3),
+    }
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+    start = model.bind(observation, clock)
+
+    # Should allow the non-local transition
+    step = model.step(start, "ACTION4")
+    assert step is not None
+    assert step.after.player == (6, 3)
+    assert "contextual_special_transition" in step.hypotheses
+
+
+def test_contextual_special_transition_overrides_geometric_navigation():
+    """Special edge is used instead of geometric guess when available."""
+    controller, observation, clock, memory, _, _ = fixture()
+    # Record a special transition that differs from adjacent cell
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", PATTERN, 14): (5, 3),  # Not the adjacent (4,3)
+    }
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+    start = model.bind(observation, clock)
+
+    # Should use the special transition, not geometric adjacent
+    step = model.step(start, "ACTION4")
+    assert step is not None
+    assert step.after.player == (5, 3)
+    assert "contextual_special_transition" in step.hypotheses
+
+
+def test_special_transition_rejected_for_wrong_status_context():
+    """Special transition only applies in matching status context."""
+    controller, observation, clock, memory, _, _ = fixture()
+    # Record a special transition for a different pattern
+    wrong_pattern = ((1, 0), (0, 1))
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", wrong_pattern, 14): (6, 3),
+    }
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+    start = model.bind(observation, clock)
+
+    # Should not match because pattern differs
+    movement = model.movement(start, "ACTION4")
+    # Falls back to geometric or other navigation
+    assert movement is None or movement[1] != "contextual_special_transition"
+
+
+def test_special_transition_rejected_for_wrong_color_context():
+    """Special transition only applies in matching color context."""
+    controller, observation, clock, memory, _, _ = fixture()
+    # Record a special transition for a different color
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", PATTERN, 9): (6, 3),  # color 9, not 14
+    }
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+    start = model.bind(observation, clock)
+
+    # Should not match because color differs
+    movement = model.movement(start, "ACTION4")
+    # Falls back to geometric or other navigation
+    assert movement is None or movement[1] != "contextual_special_transition"
+
+
+def test_special_transition_works_in_goal_search():
+    """Goal search can find paths using special transitions."""
+    controller, observation, clock, memory, _, _ = fixture()
+    # Set up a special transition and a target
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", PATTERN, 14): (6, 3),
+    }
+    targets = {(6, 3): (PATTERN, 14)}
+    model = EntityOptionModel(controller, observation, clock, memory, targets)
+    start = model.bind(observation, clock)
+
+    # Should find a path using the special transition
+    path, expanded = model.search_goal(start, NAMES)
+    assert path is not None
+    assert len(path) > 0
+    assert path[-1].after.player == (6, 3)
+    # Check that at least one step used the special transition
+    assert any("contextual_special_transition" in step.hypotheses for step in path)
+
+
 def test_new_evidence_invalidates_retained_plan_before_next_action():
     controller, observation, clock, memory, model, start = fixture()
     controller.model = model

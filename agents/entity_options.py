@@ -83,6 +83,7 @@ class EntityOptionModel:
         self.refill_signatures = deepcopy(controller.refill_signatures)
         self.failures = set(controller.bad_edges)
         self.rejected_entries = set(controller.rejected_entries)
+        self.special_transitions = dict(controller.special_transitions)
         self.atomic = defaultdict(set)
         for (
             before,
@@ -167,6 +168,13 @@ class EntityOptionModel:
         edge = node.player, action
         if edge in self.failures:
             return None
+
+        # Check for consistent contextual special transitions first
+        contextual_key = (node.player, action, node.pattern, node.color)
+        if contextual_key in self.special_transitions:
+            destination = self.special_transitions[contextual_key]
+            return destination, "contextual_special_transition"
+
         samples = self.navigation.get(edge, ())
         tiers = (
             (
@@ -217,13 +225,19 @@ class EntityOptionModel:
             node.color,
             node.fixtures,
             node.refills,
-        ) in self.rejected_entries and label != "observed_navigation_context":
+        ) in self.rejected_entries and label not in (
+            "observed_navigation_context",
+            "contextual_special_transition",
+        ):
             # Quarantine an unsupported arrival hypothesis across approaches;
             # this is abstention, not a learned universal gate/teleport rule.
             return None
         dx, dy = ACTION_DELTAS[action]
         if target not in {node.player, (node.player[0] + dx, node.player[1] + dy)}:
-            return None  # Nonlocal transitions can use a different entity clock.
+            # Nonlocal transitions can use a different entity clock, but allow
+            # them when backed by a consistent contextual special transition.
+            if label != "contextual_special_transition":
+                return None
         moved = target != node.player
         fixtures = [(cell, sig) for cell, sig in node.fixtures if cell == target]
         fixture = None
@@ -483,6 +497,7 @@ class EntityOptionController:
         self.refill_signatures = defaultdict(set)
         self.bad_edges = set()
         self.rejected_entries = set()
+        self.special_transitions = {}
         self.attempts = Counter()
         self.fixture_attempts = Counter()
         self.metrics = Counter()
@@ -638,8 +653,10 @@ class EntityOptionController:
         self.previous_phases = phases
         self.previous_signatures = signatures
 
-    def choose(self, state, dynamic, effects, targets, names):
+    def choose(self, state, dynamic, effects, targets, names, special_transitions=None):
         names = tuple(n for n in names if n in ACTION_DELTAS)
+        if special_transitions is not None:
+            self.special_transitions = special_transitions
         if self.metrics["steps_selected"] >= self.MAX_STEPS:
             if self.model is not None:
                 self.invalidate("action_budget")
