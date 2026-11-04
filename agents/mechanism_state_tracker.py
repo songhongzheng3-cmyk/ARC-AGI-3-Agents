@@ -8,7 +8,7 @@ task-level events without assigning semantic meaning to concrete colours.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import gcd
 from typing import Any, Iterable
 
@@ -93,6 +93,9 @@ class MechanismState:
     status_color: int | None = None
     player_component_ids: tuple[str, ...] = ()
     player_bbox: BBox | None = None
+    # Conservative visual eligibility, not an observed movement guarantee.
+    navigation_projection_cells: frozenset[Cell] = frozenset()
+    motion_entities: tuple[MechanismObject, ...] | None = None
 
     @property
     def status_signature(self) -> str:
@@ -222,13 +225,15 @@ def _shape_signature(mask: np.ndarray) -> str:
 class MechanismStateTracker:
     """Incrementally infer stable mechanism signals from public observations."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, enable_entity_tracking: bool = False) -> None:
+        self.enable_entity_tracking = enable_entity_tracking
         self.layout: GridLayout | None = None
         self.previous_grid: np.ndarray | None = None
         self.previous_state: MechanismState | None = None
         self.resource_capacity = 0
         self.resource_right_endpoint: int | None = None
         self.resource_row_band: tuple[int, int] | None = None
+        self.resource_color: int | None = None
         self.player_position: Cell | None = None
         self.player_confidence = 0.0
         self.player_bbox: BBox | None = None
@@ -242,6 +247,7 @@ class MechanismStateTracker:
         self.resource_capacity = 0
         self.resource_right_endpoint = None
         self.resource_row_band = None
+        self.resource_color = None
         self.player_position = None
         self.player_confidence = 0.0
         self.player_bbox = None
@@ -255,6 +261,7 @@ class MechanismStateTracker:
         self.resource_capacity = 0
         self.resource_right_endpoint = None
         self.resource_row_band = None
+        self.resource_color = None
         self.player_position = None
         self.player_confidence = 0.0
         self.player_bbox = None
@@ -295,9 +302,10 @@ class MechanismStateTracker:
             x1, y1, x2, y2 = item.bbox
             width = x2 - x1 + 1
             height = y2 - y1 + 1
-            close = abs(item.cell[0] - player[0]) <= 1 and abs(
-                item.cell[1] - player[1]
-            ) <= 1
+            close = (
+                abs(item.cell[0] - player[0]) <= 1
+                and abs(item.cell[1] - player[1]) <= 1
+            )
             if (
                 close
                 and width >= cell_width - 1
@@ -399,8 +407,7 @@ class MechanismStateTracker:
                 )
                 x1, y1, x2, y2 = destination_bbox
                 if not (
-                    0 <= x1 <= x2 < grid.shape[1]
-                    and 0 <= y1 <= y2 < grid.shape[0]
+                    0 <= x1 <= x2 < grid.shape[1] and 0 <= y1 <= y2 < grid.shape[0]
                 ):
                     continue
                 destination = grid[y1 : y2 + 1, x1 : x2 + 1]
@@ -545,6 +552,24 @@ class MechanismStateTracker:
         return frozenset(walkable), frozenset(blocked)
 
     @staticmethod
+    def _navigation_projection_cells(
+        grid: np.ndarray, layout: GridLayout, walkable: frozenset[Cell]
+    ) -> frozenset[Cell]:
+        ox, oy = layout.origin
+        width, height = layout.cell_size
+        return frozenset(
+            (x, y)
+            for x, y in walkable
+            if not np.any(
+                grid[
+                    oy + y * height : oy + (y + 1) * height,
+                    ox + x * width : ox + (x + 1) * width,
+                ]
+                == layout.background_color
+            )
+        )
+
+    @staticmethod
     def _status_pattern(grid: np.ndarray, layout: GridLayout) -> Pattern:
         if layout.projected_view or grid.shape[0] < 61 or grid.shape[1] < 12:
             return ()
@@ -587,6 +612,7 @@ class MechanismStateTracker:
                 if (
                     x2 == self.resource_right_endpoint
                     and (y1, y2) == self.resource_row_band
+                    and component.color == self.resource_color
                 ):
                     return component.area
                 continue
@@ -601,6 +627,7 @@ class MechanismStateTracker:
         )
         self.resource_right_endpoint = selected.bbox[2]
         self.resource_row_band = (selected.bbox[1], selected.bbox[3])
+        self.resource_color = selected.color
         return selected.area
 
     @staticmethod
@@ -898,7 +925,7 @@ class MechanismStateTracker:
                         0.95,
                     )
                 )
-            elif 0 < resource < previous.resource_level:
+            elif resource < previous.resource_level:
                 events.append(
                     self._event(
                         "resource_decreased",
@@ -1019,7 +1046,18 @@ class MechanismStateTracker:
             status_color=status_color,
             player_component_ids=player_component_ids,
             player_bbox=self.player_bbox,
+            navigation_projection_cells=(
+                frozenset()
+                if layout is None
+                else self._navigation_projection_cells(grid, layout, walkable)
+            ),
         )
+        if self.enable_entity_tracking:
+            from .component_entities import extract_entities
+
+            state = replace(
+                state, motion_entities=extract_entities(state, grid).objects
+            )
         self.previous_state = state
         self.previous_grid = grid.copy()
         self._level = level

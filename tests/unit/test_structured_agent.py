@@ -1,8 +1,10 @@
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from arcengine import GameAction, GameState
 
+from agents.episode_memory import EpisodeMemory
 from agents.templates.structured_agent import StructuredAgent
 
 
@@ -13,6 +15,8 @@ def _agent():
     agent.mechanism_policy = Mock()
     agent.last_action = "ACTION3"
     agent.fallback_counts = {}
+    agent.fallback_clicks_by_level = defaultdict(set)
+    agent.episode_memory = EpisodeMemory()
     return agent
 
 
@@ -61,6 +65,7 @@ def test_uses_mechanism_policy_when_navigation_is_done():
     agent.mechanism_policy.choose.assert_called_once_with(
         mechanism_state,
         frame.available_actions,
+        previous_action="ACTION3",
     )
 
 
@@ -109,3 +114,107 @@ def test_fallback_keeps_distinct_player_positions_separate():
 
     assert agent._fallback(frame, first_state) is GameAction.ACTION1
     assert agent._fallback(frame, second_state) is GameAction.ACTION1
+
+
+def test_fallback_executes_action6_with_extracted_coordinates():
+    agent = _agent()
+    frame = _frame()
+    frame.available_actions = [6]
+    frame.frame = [[[0] * 8 for _ in range(8)]]
+    frame.frame[0][3][4] = 9
+    frame.frame[0][3][5] = 9
+    state = SimpleNamespace(
+        player_position=None,
+        status_signature="empty",
+        status_color=None,
+    )
+
+    action = agent._fallback(frame, state)
+
+    assert action is GameAction.ACTION6
+    assert 0 <= action.action_data.x < 8
+    assert 0 <= action.action_data.y < 8
+
+
+def test_fallback_does_not_repeat_an_unchanged_click_coordinate():
+    agent = _agent()
+    frame = _frame()
+    frame.available_actions = [6]
+    frame.frame = [[[0] * 8 for _ in range(8)]]
+    frame.frame[0][3][4] = 9
+    frame.frame[0][3][5] = 9
+    state = SimpleNamespace(
+        player_position=None,
+        status_signature="empty",
+        status_color=None,
+    )
+
+    first = agent._fallback(frame, state)
+    first_xy = (first.action_data.x, first.action_data.y)
+    state_hash = agent.episode_memory.state_hash(frame)
+    agent.episode_memory.record_action(
+        first.name,
+        {"x": first_xy[0], "y": first_xy[1]},
+        state_hash,
+        score=1,
+    )
+    agent.episode_memory.observe_frame(frame)
+    second = agent._fallback(frame, state)
+
+    assert (second.action_data.x, second.action_data.y) != first_xy
+
+
+def test_fallback_click_dedup_survives_animated_grid_changes():
+    agent = _agent()
+    frame = _frame()
+    frame.available_actions = [6]
+    frame.frame = [[[0] * 8 for _ in range(8)]]
+    frame.frame[0][3][4] = 9
+    frame.frame[0][3][5] = 9
+    state = SimpleNamespace(
+        player_position=None,
+        status_signature="empty",
+        status_color=None,
+    )
+    first = agent._fallback(frame, state)
+    first_xy = (first.action_data.x, first.action_data.y)
+
+    animated = _frame()
+    animated.available_actions = [6]
+    animated.frame = [[row[:] for row in frame.frame[0]]]
+    animated.frame[0][0][0] = 1
+    second = agent._fallback(animated, state)
+
+    assert (second.action_data.x, second.action_data.y) != first_xy
+
+
+def test_fallback_uses_legal_click_after_candidate_budget_is_exhausted():
+    agent = _agent()
+    frame = _frame()
+    frame.available_actions = [6]
+    frame.frame = [[[0] * 8 for _ in range(8)]]
+    state = SimpleNamespace(
+        player_position=None,
+        status_signature="empty",
+        status_color=None,
+    )
+    agent.fallback_clicks_by_level[1].update(
+        (x, 0) for x in range(StructuredAgent.MAX_FALLBACK_CLICK_TRIALS)
+    )
+
+    action = agent._fallback(frame, state)
+
+    assert action is GameAction.ACTION6
+
+
+def test_policy_action_not_in_available_actions_uses_fallback():
+    agent = _agent()
+    frame = _frame()
+    frame.available_actions = [2]
+    agent.mechanism_tracker.observe.return_value = object()
+    agent.mechanism_tracker.summary.return_value = "state"
+    agent.navigation_policy.choose.return_value = GameAction.ACTION4
+
+    action = agent.choose_action([], frame)
+
+    assert action is GameAction.ACTION2

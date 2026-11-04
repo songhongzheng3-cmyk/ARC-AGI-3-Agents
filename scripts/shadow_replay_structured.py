@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import defaultdict
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from agents.episode_memory import EpisodeMemory  # noqa: E402
 from agents.mechanism_policy import MechanismPolicy  # noqa: E402
 from agents.mechanism_state_tracker import MechanismStateTracker  # noqa: E402
 from agents.navigation_frontier_policy import NavigationFrontierPolicy  # noqa: E402
@@ -59,10 +62,21 @@ def make_agent() -> StructuredAgent:
     """Construct only the policy state needed by choose_action()."""
     agent = StructuredAgent.__new__(StructuredAgent)
     agent.navigation_policy = NavigationFrontierPolicy()
-    agent.mechanism_tracker = MechanismStateTracker()
-    agent.mechanism_policy = MechanismPolicy()
+    agent.mechanism_tracker = MechanismStateTracker(
+        enable_entity_tracking=os.getenv("STRUCTURED_ENTITY_TRACKING", "0") == "1",
+    )
+    agent.mechanism_policy = MechanismPolicy(
+        enable_joint_navigation=os.getenv("STRUCTURED_JOINT_NAVIGATION", "1") != "0",
+        enable_motion_context=os.getenv("STRUCTURED_MOTION_CONTEXT", "0") == "1",
+        enable_dynamic_contact=os.getenv("STRUCTURED_DYNAMIC_CONTACT", "0") == "1",
+        enable_option_compiler=os.getenv("STRUCTURED_OPTION_COMPILER", "0") == "1",
+        enable_contact_effects=os.getenv("STRUCTURED_CONTACT_EFFECTS", "0") == "1",
+        enable_entity_options=os.getenv("STRUCTURED_ENTITY_OPTIONS", "0") == "1",
+    )
+    agent.episode_memory = EpisodeMemory()
     agent.last_action = None
     agent.fallback_counts = defaultdict(lambda: defaultdict(int))
+    agent.fallback_clicks_by_level = defaultdict(set)
     return agent
 
 
@@ -75,9 +89,7 @@ def state_snapshot(agent: StructuredAgent, frame: FrameData) -> dict[str, Any]:
         "player": None if state is None else state.player_position,
         "resource_level": None if state is None else state.resource_level,
         "resource_steps": (
-            None
-            if state is None
-            else agent.mechanism_policy._resource_steps(state)
+            None if state is None else agent.mechanism_policy._resource_steps(state)
         ),
         "status_signature": None if state is None else state.status_signature,
         "status_color": None if state is None else state.status_color,
@@ -89,12 +101,22 @@ def state_snapshot(agent: StructuredAgent, frame: FrameData) -> dict[str, Any]:
         "route_length": None if decision is None else decision.route_length,
         "known_refills": sorted(agent.mechanism_policy.refill_cells),
         "known_pattern_changers": sorted(agent.mechanism_policy.changer_cells),
-        "known_palette_changers": sorted(
-            agent.mechanism_policy.palette_changer_cells
-        ),
+        "known_palette_changers": sorted(agent.mechanism_policy.palette_changer_cells),
         "joint_transition_count": len(
             agent.mechanism_policy.joint_mechanism_graph.transitions()
         ),
+        "navigation_edge_count": len(agent.mechanism_policy.joint_navigation.edges),
+        "navigation_conflicts": agent.mechanism_policy.joint_navigation.counterexamples,
+        "motion_context": [
+            asdict(item) for item in agent.mechanism_policy.motion_context.context
+        ],
+        "dynamic_contact_metrics": dict(agent.mechanism_policy.dynamic_contact.metrics),
+        "dynamic_effect_samples": sum(
+            agent.mechanism_policy.dynamic_contact.effect_samples.values()
+        ),
+        "navigation_prediction_checks": agent.mechanism_policy.joint_prediction_checks,
+        "navigation_prediction_errors": agent.mechanism_policy.joint_prediction_errors,
+        "navigation_search": dict(agent.mechanism_policy.joint_navigation.last_search),
         "task_plan_id": None if plan is None else plan.plan_id,
         "task_plan_stage": None if stage is None else stage.kind.value,
         "task_plan_stage_index": None if plan is None else plan.current_stage_index,

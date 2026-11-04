@@ -71,6 +71,34 @@ def test_emits_mechanism_and_level_events():
     assert pattern_key(changed.status_pattern) == "111/001/101"
 
 
+def test_empty_resource_meter_is_not_a_full_meter_in_the_background_color():
+    tracker = MechanismStateTracker()
+    tracker.observe(_frame(_synthetic_grid(resource_width=8)))
+    depleted = _synthetic_grid(resource_width=0)
+    for y in (61, 62):
+        for x in range(47, 55):
+            depleted[y][x] = 3
+    empty = tracker.observe(_frame(depleted), action="ACTION1")
+    assert empty.resource_level == 0
+    assert empty.resource_capacity == 16
+    assert "resource_decreased" in {event.event_type for event in empty.events}
+    assert "resource_increased" not in {event.event_type for event in empty.events}
+    refill = tracker.observe(_frame(_synthetic_grid()), action="ACTION1")
+    assert refill.resource_level == 16
+
+
+def test_resource_palette_is_reinferred_when_level_changes():
+    tracker = MechanismStateTracker()
+    tracker.observe(_frame(_synthetic_grid()))
+    recolored = _synthetic_grid()
+    for y in (61, 62):
+        for x in range(47, 55):
+            recolored[y][x] = 12
+    state = tracker.observe(_frame(recolored, level=1))
+    assert state.resource_level == 16
+    assert tracker.resource_color == 12
+
+
 def test_emits_palette_event_when_pattern_is_unchanged():
     tracker = MechanismStateTracker()
     before = tracker.observe(_frame(_synthetic_grid(status_color=9)))

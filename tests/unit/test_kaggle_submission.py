@@ -8,7 +8,7 @@ import zipfile
 
 import pytest
 
-from scripts.build_kaggle_submission import build_notebook, make_bundle
+from scripts.build_kaggle_submission import build_notebook, collect_sources, make_bundle
 from scripts.kaggle_submit import validate_notebook
 
 
@@ -68,3 +68,42 @@ def test_upload_requires_backend_distribution_rights(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["kaggle_submit.py", "push"])
     with pytest.raises(SystemExit, match="no explicit redistribution license"):
         main()
+
+
+def test_owned_only_bundle_excludes_reference_backend(tmp_path, monkeypatch):
+    from scripts import kaggle_submit
+
+    root = tmp_path / "project"
+    from scripts.build_kaggle_submission import SOURCE_FILES
+
+    for name in SOURCE_FILES:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {name}\n")
+    (root / "scripts").mkdir(exist_ok=True)
+    (root / "scripts/kaggle_runner.py").write_text("# runner\n")
+    (root / "scripts/kaggle_runtime.py").write_text("# runtime\n")
+    monkeypatch.setattr("scripts.build_kaggle_submission.git", lambda *_: "revision")
+    sources, manifest = collect_sources(root, None)
+    assert manifest["agents"] == {"all": "StructuredAgent"}
+    assert not any(
+        "ls20_solver_agent" in name or name.startswith("backend/") for name in sources
+    )
+
+    bundle = make_bundle(sources)
+    monkeypatch.setattr(kaggle_submit, "ROOT", tmp_path)
+    output = tmp_path / "sampling_runs/kaggle_bundle_owned"
+    output.mkdir(parents=True)
+    (output / "sources.zip").write_bytes(bundle)
+    starter = tmp_path / "starter"
+    directory = starter / "notebooks-owned"
+    directory.mkdir(parents=True)
+    (directory / "submission.ipynb").write_text(
+        json.dumps(build_notebook(bundle, owned_only=True))
+    )
+    validate_notebook(starter, owned_only=True)
+
+    sources["backend/src/ls20/agent.py"] = b"unlicensed\n"
+    (output / "sources.zip").write_bytes(make_bundle(sources))
+    with pytest.raises(ValueError, match="reference backend"):
+        validate_notebook(starter, owned_only=True)

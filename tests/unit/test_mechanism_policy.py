@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+from agents.joint_navigation import NavigationNode
 from agents.mechanism_policy import (
     MechanismDecision,
     MechanismPolicy,
@@ -11,7 +12,159 @@ from agents.mechanism_state_tracker import (
     MechanismObject,
     MechanismState,
 )
-from agents.task_planning import JointMechanismState, PlanStageKind
+from agents.task_planning import JointMechanismState, PlanStage, PlanStageKind
+
+
+def _joint_navigation_fixture():
+    policy = MechanismPolicy()
+    state = _state(status_color=9)
+    target = _object((4, 4), 10, pattern=((1, 1), (0, 0)), static=True, pattern_color=8)
+    start = NavigationNode(state.player_position, policy._joint_state(state))
+    changed = NavigationNode((3, 3), JointMechanismState(target.pattern_signature, 8))
+    goal = NavigationNode(target.cell, changed.status)
+    policy.special_transitions[((1, 1), "ACTION4")] = changed.position
+    for before, action, after in [
+        (start, "ACTION4", changed),
+        (changed, "ACTION2", goal),
+    ]:
+        policy.joint_navigation.record(
+            before, action, after, resource_before=40, resource_after=36
+        )
+    return policy, state, {target.cell: target}, goal
+
+
+def test_joint_navigation_selects_cross_context_mission_and_checks_next_frame():
+    policy, state, targets, goal = _joint_navigation_fixture()
+    decision = policy._joint_navigation_decision(
+        state, targets, list(policy.DIRECTION_NAMES)
+    )
+    assert decision is not None
+    assert decision.objective == "joint_navigation_goal"
+    assert decision.action == "ACTION4"
+    assert decision.route_length == 2
+    policy._previous_navigation_state = state
+    policy._set_decision(state, decision)
+    policy._update_evidence(
+        replace(
+            state,
+            player_position=(3, 3),
+            status_pattern=((1, 1), (0, 0)),
+            status_color=8,
+            resource_level=36,
+        )
+    )
+    assert policy.joint_prediction_checks == 1
+    assert policy.joint_prediction_errors == 0
+
+
+def test_joint_navigation_does_not_interrupt_actuator_probe_or_valid_task_plan():
+    policy, state, targets, goal = _joint_navigation_fixture()
+    policy.active_actuator_probe = ((3, 3), "palette")
+    assert (
+        policy._joint_navigation_decision(state, targets, list(policy.DIRECTION_NAMES))
+        is None
+    )
+    policy.active_actuator_probe = None
+    plan = policy.task_plan_controller.install(
+        level=state.level,
+        goal=goal.status,
+        stages=[
+            PlanStage(
+                kind=PlanStageKind.CONTACT_TARGET,
+                target=goal.position,
+                expected_before=goal.status,
+                expected_after=goal.status,
+                estimated_steps=2,
+            )
+        ],
+        topology_revision=0,
+    )
+    assert (
+        policy._joint_navigation_decision(state, targets, list(policy.DIRECTION_NAMES))
+        is None
+    )
+    assert policy.task_plan_controller.active_plan is plan
+
+
+def test_reset_boundary_does_not_record_teleport_or_false_refill():
+    policy, state, targets, _ = _joint_navigation_fixture()
+    decision = policy._joint_navigation_decision(
+        state, targets, list(policy.DIRECTION_NAMES)
+    )
+    policy._set_decision(state, decision)
+    policy._previous_navigation_state = state
+    edge_count = len(policy.joint_navigation.edges)
+    special_before = dict(policy.special_transitions)
+    policy.note_reset()
+    policy._update_evidence(replace(state, player_position=(4, 0), resource_level=40))
+    assert len(policy.joint_navigation.edges) == edge_count
+    assert policy.joint_prediction_checks == 0
+    assert policy.special_transitions == special_before
+    assert not policy.refill_cells
+
+
+def test_automatic_restart_after_empty_meter_is_not_learned_as_motion_or_refill():
+    policy = MechanismPolicy()
+    before = _state(player=(1, 1), resource=0)
+    policy._update_evidence(before)
+    policy._set_decision(
+        before, MechanismDecision("ACTION4", "discover_resource_source", (2, 1), 1)
+    )
+    policy._update_evidence(
+        replace(
+            before,
+            player_position=(4, 4),
+            resource_level=40,
+            events=(MechanismEvent("resource_increased", action="ACTION4"),),
+        )
+    )
+    assert not policy.joint_navigation.edges
+    assert not policy.special_transitions
+    assert not policy.observed_transitions
+    assert not policy.refill_cells
+    assert not policy.joint_mechanism_graph.transitions()
+
+
+def test_player_occlusion_does_not_change_completion_goal_or_mark_it_dynamic():
+    policy = MechanismPolicy()
+    target = _object(
+        (1, 1), 43, color=5, pattern=((1, 1), (0, 1)), static=True, pattern_color=9
+    )
+    clear = _state(
+        player=(4, 4), player_bbox=(20, 20, 24, 24), objects=[target], status_color=9
+    )
+    policy._update_evidence(clear)
+    corrupted = replace(target, internal_pattern=((0, 0, 1), (1, 1, 1), (0, 1, 1)))
+    covered = replace(
+        clear, player_position=(2, 1), player_bbox=(6, 5, 10, 9), objects=(corrupted,)
+    )
+    policy._update_evidence(covered)
+    assert (
+        policy._static_targets(covered)[target.cell].internal_pattern
+        == target.internal_pattern
+    )
+    # The entire target may also disappear under the player.
+    assert policy._static_targets(replace(covered, objects=()))[target.cell] == target
+    policy._update_evidence(
+        replace(clear, events=(MechanismEvent("status_pattern_changed"),))
+    )
+    assert not policy.dynamic_target_cells
+
+
+def test_uncovered_target_changes_are_not_hidden_by_target_memory():
+    policy = MechanismPolicy()
+    target = _object(
+        (1, 1), 43, color=5, pattern=((1, 1), (0, 1)), static=True, pattern_color=9
+    )
+    clear = _state(player=(4, 4), player_bbox=(20, 20, 24, 24), objects=[target])
+    policy._update_evidence(clear)
+    changed = replace(target, internal_pattern=((1, 0), (1, 1)))
+    after = replace(
+        clear, objects=(changed,), events=(MechanismEvent("status_pattern_changed"),)
+    )
+    policy._update_evidence(after)
+    assert policy._static_targets(after)[target.cell] == changed
+    assert target.cell in policy.dynamic_target_cells
 
 
 def _object(
@@ -67,6 +220,58 @@ def _state(
         player_component_ids=tuple(player_component_ids),
         player_bbox=player_bbox,
     )
+
+
+def test_option_compiler_is_opt_in_and_clears_level_not_configuration():
+    assert not MechanismPolicy().enable_option_compiler
+    policy = MechanismPolicy(enable_dynamic_contact=True, enable_option_compiler=True)
+    policy._reset_level(4)
+    policy.option_controller.metrics["installed_plans"] = 2
+    policy._reset_level(5)
+    assert policy.option_controller.metrics["installed_plans"] == 0
+    assert policy.option_archives[-1]["level"] == 4
+    assert policy.option_archives[-1]["metrics"]["installed_plans"] == 2
+    policy.reset()
+    assert policy.enable_dynamic_contact
+    assert policy.enable_option_compiler
+    assert not policy.option_archives
+
+
+def test_motion_context_is_opt_in_and_survives_policy_reset_configuration():
+    assert not MechanismPolicy().enable_motion_context
+    policy = MechanismPolicy(enable_motion_context=True)
+    before = _state(objects=[_object((2, 2), 3)])
+    after = _state(objects=[_object((3, 2), 3)])
+    policy._update_evidence(before)
+    policy._update_evidence(after)
+    assert policy.motion_context.context
+    policy.note_reset()
+    assert not policy.motion_context.context
+    assert not policy.motion_context.positions
+    policy.reset()
+    assert policy.enable_motion_context
+
+
+def test_navigation_records_actual_before_and_after_motion_context():
+    policy = MechanismPolicy(enable_motion_context=True)
+    for object_cell in ((1, 2), (2, 2)):
+        policy._update_evidence(_state(objects=[_object(object_cell, 3)]))
+    source = policy._previous_navigation_state
+    before_context = policy.motion_context.context
+    assert before_context[0].previous == (1, 2)
+    assert before_context[0].current == (2, 2)
+    policy._set_decision(source, MechanismDecision("ACTION4", "probe", (2, 1), 1))
+    policy._update_evidence(
+        _state(player=(2, 1), resource=36, objects=[_object((3, 2), 3)])
+    )
+    key = (
+        NavigationNode((1, 1), policy._joint_state(source), before_context),
+        "ACTION4",
+    )
+    edge = policy.joint_navigation.edges[key]
+    assert edge.destination.context == policy.motion_context.context
+    assert edge.destination.context[0].previous == (2, 2)
+    assert edge.destination.context[0].current == (3, 2)
 
 
 def test_prefers_multi_part_candidate_and_learns_changer():
@@ -221,9 +426,7 @@ def test_route_uses_special_transition_in_matching_status_context():
     policy = MechanismPolicy()
     edge = ((1, 1), "ACTION4")
     policy.special_transitions[edge] = (4, 4)
-    policy.contextual_special_transitions[
-        ((1, 1), "ACTION4", "10/01", 9)
-    ] = (4, 4)
+    policy.contextual_special_transitions[((1, 1), "ACTION4", "10/01", 9)] = (4, 4)
     state = replace(
         _state(player=(1, 1), status=((1, 0), (0, 1)), status_color=9),
         walkable_cells=frozenset({(1, 1), (4, 4)}),
@@ -236,9 +439,7 @@ def test_reuses_learned_relocation_edge_for_navigation():
     policy = MechanismPolicy()
     edge = ((1, 1), "ACTION4")
     policy.special_transitions[edge] = (4, 4)
-    policy.contextual_special_transitions[
-        ((1, 1), "ACTION4", "10/01", 9)
-    ] = (4, 4)
+    policy.contextual_special_transitions[((1, 1), "ACTION4", "10/01", 9)] = (4, 4)
     state = replace(
         _state(player=(1, 1), status=((1, 0), (0, 1)), status_color=9),
         walkable_cells=frozenset({(1, 1), (4, 4)}),
@@ -270,15 +471,27 @@ def test_route_rejects_special_transition_in_different_status_context():
     policy = MechanismPolicy()
     edge = ((1, 1), "ACTION4")
     policy.special_transitions[edge] = (4, 4)
-    policy.contextual_special_transitions[
-        ((1, 1), "ACTION4", "10/01", 9)
-    ] = (4, 4)
+    policy.contextual_special_transitions[((1, 1), "ACTION4", "10/01", 9)] = (4, 4)
     state = replace(
         _state(player=(1, 1), status=((0, 1), (1, 0)), status_color=9),
         walkable_cells=frozenset({(1, 1), (4, 4)}),
     )
 
     assert policy._route(state, (4, 4)) is None
+
+
+def test_actuator_probe_can_reenter_its_unsafe_target_edge():
+    policy = MechanismPolicy()
+    state = _state(player=(1, 1), status_color=9)
+    edge = ((1, 1), "ACTION4", state.status_signature, state.status_color)
+    policy.unsafe_navigation_edges.add(edge)
+
+    assert policy._route(state, (2, 1)) != ["ACTION4"]
+    assert policy._route(
+        state,
+        (2, 1),
+        allow_unsafe_target_transition=True,
+    ) == ["ACTION4"]
 
 
 def test_resource_wrap_does_not_mark_recent_candidate_as_refill():
@@ -995,9 +1208,7 @@ def test_command_model_experiment_exhausts_object_state_across_player_positions(
     primary = (12, 10, "primary")
     secondary = (9, 15, "secondary")
     policy.command_dynamic_signatures.update({primary, secondary})
-    policy.dynamic_track_positions.update(
-        {primary: (2, 0), secondary: (2, 1)}
-    )
+    policy.dynamic_track_positions.update({primary: (2, 0), secondary: (2, 1)})
     positions = tuple(
         policy.dynamic_track_positions[signature]
         for signature in sorted(policy.command_dynamic_signatures)
@@ -2176,3 +2387,76 @@ def test_retries_blocked_completion_contact_before_abandoning_commitment():
 
     assert action.name == "ACTION2"
     assert policy.last_decision.objective == "contact_matching_static_object"
+
+
+def test_failed_replan_discards_actuator_with_contradicted_precondition():
+    policy = MechanismPolicy()
+    before = JointMechanismState("10/01", 8)
+    goal = JointMechanismState("10/01", 9)
+    plan = policy.task_plan_controller.install(
+        level=1,
+        goal=goal,
+        topology_revision=0,
+        stages=(
+            PlanStage(
+                kind=PlanStageKind.APPLY_ACTUATOR,
+                target=(2, 1),
+                approach=(1, 1),
+                contact_action="ACTION4",
+                expected_before=before,
+                expected_after=goal,
+            ),
+        ),
+    )
+    # Navigation changed the pattern, and there is no supported replacement
+    # path to the goal.  Cycling the old palette actuator cannot fix it.
+    drifted = _state(status=((1, 1), (0, 1)), status_color=8)
+    policy._observe_task_plan(drifted, {})
+
+    assert policy.task_plan_controller.active_plan is None
+    assert plan.invalid_reason == "stage_precondition_changed"
+    assert policy._task_plan_decision(drifted, policy.DIRECTION_NAMES) is None
+
+
+def test_replan_installs_supported_path_from_changed_status():
+    policy = MechanismPolicy()
+    before = JointMechanismState("10/01", 8)
+    goal = JointMechanismState("10/01", 9)
+    drifted = JointMechanismState("11/01", 8)
+    old_plan = policy.task_plan_controller.install(
+        level=1,
+        goal=goal,
+        topology_revision=0,
+        stages=(
+            PlanStage(
+                kind=PlanStageKind.APPLY_ACTUATOR,
+                target=(2, 1),
+                expected_before=before,
+                expected_after=goal,
+            ),
+        ),
+    )
+    policy.joint_mechanism_graph.record(
+        drifted,
+        (2, 1),
+        goal,
+        approach=(1, 1),
+        contact_action="ACTION4",
+        observed_result=(2, 1),
+    )
+    target = _object(
+        (3, 1),
+        20,
+        pattern=((1, 0), (0, 1)),
+        static=True,
+        pattern_color=9,
+    )
+    policy._observe_task_plan(
+        _state(status=((1, 1), (0, 1)), status_color=8),
+        {(3, 1): target},
+    )
+
+    new_plan = policy.task_plan_controller.active_plan
+    assert new_plan is not None and new_plan is not old_plan
+    assert new_plan.current_stage.expected_before == drifted
+    assert new_plan.goal == goal

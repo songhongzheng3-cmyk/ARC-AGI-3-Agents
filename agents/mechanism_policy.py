@@ -10,12 +10,18 @@ from typing import Any, Iterable
 
 from arcengine import GameAction
 
+from .contact_effects import ContactEffectMemory
+from .dynamic_contact import DynamicContactModel
+from .entity_options import EntityOptionController
+from .joint_navigation import JointNavigationModel, NavigationNode, NavigationStep
 from .mechanism_state_tracker import (
     ACTION_DELTAS,
     Cell,
     MechanismObject,
     MechanismState,
 )
+from .motion_context import MotionContextMemory
+from .option_compiler import OptionExecutionController
 from .task_planning import (
     JointMechanismGraph,
     JointMechanismState,
@@ -59,8 +65,37 @@ class MechanismPolicy:
 
     DIRECTION_NAMES = tuple(ACTION_DELTAS)
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        *,
+        enable_joint_navigation: bool = True,
+        enable_motion_context: bool = False,
+        enable_dynamic_contact: bool = False,
+        enable_option_compiler: bool = False,
+        enable_contact_effects: bool = False,
+        enable_entity_options: bool = False,
+    ) -> None:
         self.enabled = enabled
+        self.enable_joint_navigation = enable_joint_navigation
+        self.enable_motion_context = enable_motion_context
+        self.enable_dynamic_contact = enable_dynamic_contact
+        self.enable_option_compiler = enable_option_compiler
+        self.enable_contact_effects = enable_contact_effects
+        self.enable_entity_options = enable_entity_options
+        self.entity_options = EntityOptionController()
+        self.entity_option_archives: list[dict] = []
+        self.contact_effects = ContactEffectMemory()
+        self.contact_effect_archives: list[dict] = []
+        self.option_controller = OptionExecutionController()
+        self.option_archives: list[dict] = []
+        self.dynamic_contact = DynamicContactModel()
+        self.motion_context = MotionContextMemory()
+        self.joint_navigation = JointNavigationModel()
+        self._previous_navigation_state: MechanismState | None = None
+        self._expected_navigation_step: NavigationStep | None = None
+        self.joint_prediction_checks = 0
+        self.joint_prediction_errors = 0
         self.level: int | None = None
         self.known_walkable: set[Cell] = set()
         self.known_blocked: set[Cell] = set()
@@ -72,9 +107,7 @@ class MechanismPolicy:
         self.transition_effects: dict[
             tuple[Cell, str, str, int | None], frozenset[str]
         ] = {}
-        self.unsafe_navigation_edges: set[
-            tuple[Cell, str, str, int | None]
-        ] = set()
+        self.unsafe_navigation_edges: set[tuple[Cell, str, str, int | None]] = set()
         self.topology_revision = 0
         self.joint_mechanism_graph = JointMechanismGraph()
         self.task_plan_controller = TaskPlanController()
@@ -105,9 +138,9 @@ class MechanismPolicy:
         self.dynamic_signature_attempts: dict[tuple[int, int, str], int] = defaultdict(
             int
         )
-        self.command_joint_experiments: dict[
-            tuple[tuple[Cell, ...], str], int
-        ] = defaultdict(int)
+        self.command_joint_experiments: dict[tuple[tuple[Cell, ...], str], int] = (
+            defaultdict(int)
+        )
         self.command_experiment_action: str | None = None
         self.command_experiment_streak = 0
         self.last_command_motion_action: str | None = None
@@ -124,6 +157,7 @@ class MechanismPolicy:
         self.static_target_cells: set[Cell] = set()
         self.dynamic_target_cells: set[Cell] = set()
         self.target_states: dict[Cell, tuple[str, int | None]] = {}
+        self.target_object_memory: dict[Cell, MechanismObject] = {}
         self.committed_target: Cell | None = None
         self.committed_pattern = "empty"
         self.committed_color: int | None = None
@@ -149,17 +183,77 @@ class MechanismPolicy:
         self._last_player: Cell | None = None
         self._previous_candidate_cells: set[Cell] = set()
         self._task_plan_route_failures = 0
-        self._task_plan_recent_steps: deque[
-            tuple[Cell, str, JointMechanismState]
-        ] = deque(maxlen=8)
+        self._task_plan_recent_steps: deque[tuple[Cell, str, JointMechanismState]] = (
+            deque(maxlen=8)
+        )
         self._task_plan_recent_signature: tuple[int, int] | None = None
 
     def reset(self) -> None:
         enabled = self.enabled
-        self.__init__(enabled=enabled)
+        self.__init__(
+            enabled=enabled,
+            enable_joint_navigation=self.enable_joint_navigation,
+            enable_motion_context=self.enable_motion_context,
+            enable_dynamic_contact=self.enable_dynamic_contact,
+            enable_option_compiler=self.enable_option_compiler,
+            enable_contact_effects=self.enable_contact_effects,
+            enable_entity_options=self.enable_entity_options,
+        )
+
+    def note_reset(self) -> None:
+        """A reset is an episode boundary, never a learned movement edge."""
+        self._previous_navigation_state = None
+        self.motion_context.reset()
+        self.dynamic_contact.reset_episode()
+        self.contact_effects.reset_episode()
+        self.entity_options.reset_episode()
+        self.option_controller.reset_episode()
+        self._expected_navigation_step = None
+        self.pending_interaction = None
+        self.recent_interactions.clear()
+        self._previous_candidate_cells.clear()
+        self._last_player = None
+        self.last_resource = None
+        self.dynamic_track_positions.clear()
+        self.dynamic_track_history.clear()
+        self.active_actuator_probe = None
+        self._probe_return = None
+        self._depart_and_return = None
+        self._dynamic_plan.clear()
+        self._dynamic_plan_expected_states.clear()
+        self.task_plan_controller.invalidate("episode_reset")
+        self._task_plan_recent_steps.clear()
+        self._task_plan_recent_signature = None
 
     def _reset_level(self, level: int) -> None:
+        if self.enable_entity_options and self.level is not None:
+            if level > self.level:
+                self.entity_options.metrics["actual_level_advanced"] += 1
+                pending = self.entity_options.expected
+                if pending is not None and pending.terminal:
+                    self.entity_options.metrics["option_goal_completed"] += 1
+            self.entity_option_archives.append(
+                {"level": self.level, **self.entity_options.diagnostics()}
+            )
+        if self.enable_contact_effects and self.level is not None:
+            self.contact_effect_archives.append(
+                {"level": self.level, **self.contact_effects.diagnostics()}
+            )
+        if self.enable_option_compiler and self.level is not None:
+            self.option_archives.append(
+                {"level": self.level, **self.option_controller.diagnostics()}
+            )
         self.level = level
+        self.entity_options = EntityOptionController()
+        self.contact_effects = ContactEffectMemory()
+        self.joint_navigation = JointNavigationModel()
+        self.motion_context.reset()
+        self.dynamic_contact = DynamicContactModel()
+        self.option_controller = OptionExecutionController()
+        self._previous_navigation_state = None
+        self._expected_navigation_step = None
+        self.joint_prediction_checks = 0
+        self.joint_prediction_errors = 0
         self.known_walkable.clear()
         self.known_blocked.clear()
         self.observed_transitions.clear()
@@ -204,6 +298,7 @@ class MechanismPolicy:
         self.static_target_cells.clear()
         self.dynamic_target_cells.clear()
         self.target_states.clear()
+        self.target_object_memory.clear()
         self.committed_target = None
         self.committed_pattern = "empty"
         self.committed_color = None
@@ -276,11 +371,32 @@ class MechanismPolicy:
         }
 
     def _static_targets(self, state: MechanismState) -> dict[Cell, MechanismObject]:
-        return {
-            item.cell: item
-            for item in state.objects
-            if item.static_target and self._inside(item, state)
-        }
+        def covered(bbox: tuple[int, int, int, int]) -> bool:
+            player = state.player_bbox
+            return player is not None and not (
+                bbox[2] < player[0]
+                or player[2] < bbox[0]
+                or bbox[3] < player[1]
+                or player[3] < bbox[1]
+            )
+
+        # Pixel overlap invalidates the observed target pattern: the player's
+        # sprite can become an extra connected part inside the goal's crop.
+        # Preserve the last unobstructed observation only while it is covered;
+        # once uncovered, real target changes remain observable.
+        result = {}
+        for item in state.objects:
+            if (
+                item.static_target
+                and self._inside(item, state)
+                and not covered(item.bbox)
+            ):
+                result[item.cell] = item
+                self.target_object_memory[item.cell] = item
+        for cell, item in self.target_object_memory.items():
+            if covered(item.bbox):
+                result[cell] = item
+        return result
 
     def _candidate_cells(self, state: MechanismState) -> list[Cell]:
         groups = self._object_groups(state)
@@ -406,7 +522,46 @@ class MechanismPolicy:
         visible_candidates = set(self._likely_refill_cells(state))
         return self.refill_cells.intersection(visible_candidates)
 
-    def _update_evidence(self, state: MechanismState) -> None:
+    def _update_evidence(
+        self, state: MechanismState, *, actual_action: str | None = None
+    ) -> None:
+        # An action after an observed empty meter can restart the scene even
+        # while the SDK continues to report NOT_FINISHED. This is not a refill
+        # or an actuator/motion outcome of the pending action.
+        if (
+            self._previous_navigation_state is not None
+            and self._previous_navigation_state.level == state.level
+            and self._previous_navigation_state.resource_capacity > 0
+            and self._previous_navigation_state.resource_level == 0
+            and state.resource_level > 0
+        ):
+            self.note_reset()
+        dynamic_effect = False
+        if self.enable_dynamic_contact:
+            self.dynamic_contact.observe(
+                state,
+                action=actual_action
+                or (
+                    None
+                    if self.pending_interaction is None
+                    else self.pending_interaction.action
+                ),
+            )
+            dynamic_effect = len(self.dynamic_contact.last_contacts) == 1 and any(
+                event.event_type in {"status_pattern_changed", "status_palette_changed"}
+                for event in state.events
+            )
+            if self.enable_contact_effects:
+                self.contact_effects.observe(
+                    state,
+                    self.dynamic_contact,
+                    action=actual_action
+                    or (
+                        None
+                        if self.pending_interaction is None
+                        else self.pending_interaction.action
+                    ),
+                )
         self.known_walkable.update(state.walkable_cells)
         self.known_blocked.update(state.blocked_cells)
         self.known_blocked.difference_update(self.known_walkable)
@@ -501,10 +656,10 @@ class MechanismPolicy:
             ):
                 self.refill_cells.add(covered_candidate)
                 self.contacted_cells.add(covered_candidate)
-            if "status_pattern_changed" in event_types:
+            if "status_pattern_changed" in event_types and not dynamic_effect:
                 self.changer_cells.add(covered_candidate)
                 self.contacted_cells.add(covered_candidate)
-            if "status_palette_changed" in event_types:
+            if "status_palette_changed" in event_types and not dynamic_effect:
                 self.palette_changer_cells.add(covered_candidate)
                 self.contacted_cells.add(covered_candidate)
 
@@ -533,6 +688,43 @@ class MechanismPolicy:
             self.resource_cost = gcd(self.resource_cost, delta) or delta
 
         pending = self.pending_interaction
+        previous_navigation = self._previous_navigation_state
+        previous_context = self.motion_context.context
+        current_context = (
+            self.motion_context.observe(state) if self.enable_motion_context else ()
+        )
+        if (
+            previous_navigation is not None
+            and previous_navigation.level == state.level
+            and previous_navigation.player_position is not None
+            and player is not None
+            and min(previous_navigation.player_confidence, state.player_confidence)
+            >= 0.8
+            and pending is not None
+            and pending.source == previous_navigation.player_position
+            and not resource_wrapped
+        ):
+            before_node = NavigationNode(
+                previous_navigation.player_position,
+                self._joint_state(previous_navigation),
+                previous_context,
+            )
+            after_node = NavigationNode(
+                player, self._joint_state(state), current_context
+            )
+            self.joint_navigation.record(
+                before_node,
+                pending.action,
+                after_node,
+                resource_before=previous_navigation.resource_level,
+                resource_after=state.resource_level,
+            )
+            prediction = self._expected_navigation_step
+            if prediction is not None and prediction.source == before_node:
+                self.joint_prediction_checks += 1
+                self.joint_prediction_errors += prediction.destination != after_node
+        self._previous_navigation_state = state
+        self._expected_navigation_step = None
         if pending is not None:
             context_key = (
                 pending.source,
@@ -660,6 +852,7 @@ class MechanismPolicy:
                 and exploratory
                 and pending.target not in self.static_target_cells
                 and pending.objective != "contact_matching_static_object"
+                and not dynamic_effect
             )
             if reached:
                 self.contacted_cells.add(pending.target)
@@ -741,7 +934,7 @@ class MechanismPolicy:
                     if pending.target not in self.lifecycle_evidence_cells:
                         self.no_effect_cells.add(pending.target)
 
-        if event_types.intersection(
+        if not dynamic_effect and event_types.intersection(
             {
                 "resource_increased",
                 "status_pattern_changed",
@@ -793,7 +986,7 @@ class MechanismPolicy:
         # full cycle without assuming how many states or colours it contains.
         # A matching completion target can interrupt this experiment later in
         # choose(), so pattern actuators need not be cycled past a solved state.
-        if pending is not None:
+        if pending is not None and not dynamic_effect:
             reached = pending.target in {pending.destination, player}
             probe_cell = pending.target
             dimensions: list[tuple[str, str | int | None]] = []
@@ -834,7 +1027,7 @@ class MechanismPolicy:
         # effect identified the contacted cell as an actuator.  This preserves
         # the causal before/contact/after boundary required by task planning;
         # ordinary movement and visual animation never become graph edges.
-        if pending is not None and status_changed:
+        if pending is not None and status_changed and not dynamic_effect:
             reached = pending.target in {pending.destination, player}
             learned_actuator = (
                 pending.target in self.changer_cells
@@ -1093,10 +1286,7 @@ class MechanismPolicy:
         joint planners still require both current positions before acting.
         """
         return (
-            sum(
-                signature[1] >= 10
-                for signature in self.command_dynamic_signatures
-            )
+            sum(signature[1] >= 10 for signature in self.command_dynamic_signatures)
             >= 2
         )
 
@@ -1350,8 +1540,7 @@ class MechanismPolicy:
                     continue
 
                 object_edge_unknown = sum(
-                    (signature, position, action)
-                    not in self.dynamic_action_transitions
+                    (signature, position, action) not in self.dynamic_action_transitions
                     for signature, position in zip(signatures, positions)
                 )
                 observed_player = self.observed_transitions.get((source, action))
@@ -1371,9 +1560,8 @@ class MechanismPolicy:
                 for signature, moving_from, moved_to in zip(
                     signatures, positions, moving_to
                 ):
-                    if (
-                        (destination == source and moved_to == source)
-                        or (source == moved_to and destination == moving_from)
+                    if (destination == source and moved_to == source) or (
+                        source == moved_to and destination == moving_from
                     ):
                         retry_key = (signature, source, action)
                         if self.dynamic_contact_retries[retry_key] < 4:
@@ -1612,9 +1800,8 @@ class MechanismPolicy:
                 for signature, moving_from, moved_to in zip(
                     signatures, positions, moving_to
                 ):
-                    if (
-                        (destination == source and moved_to == source)
-                        or (source == moved_to and destination == moving_from)
+                    if (destination == source and moved_to == source) or (
+                        source == moved_to and destination == moving_from
                     ):
                         retry_key = (signature, source, action)
                         if self.dynamic_contact_retries[retry_key] < 4:
@@ -1955,7 +2142,13 @@ class MechanismPolicy:
             route_length=1,
         )
 
-    def _route(self, state: MechanismState, target: Cell) -> list[str] | None:
+    def _route(
+        self,
+        state: MechanismState,
+        target: Cell,
+        *,
+        allow_unsafe_target_transition: bool = False,
+    ) -> list[str] | None:
         start = state.player_position
         if start is None:
             return None
@@ -1991,8 +2184,6 @@ class MechanismPolicy:
                     state.status_signature,
                     state.status_color,
                 )
-                if contextual_edge in self.unsafe_navigation_edges:
-                    continue
                 if contextual_edge in self.contextual_special_transitions:
                     # Reuse a nonlocal transition only in the status context
                     # where its actual destination was observed.
@@ -2009,10 +2200,11 @@ class MechanismPolicy:
                         (cell[0] + dx, cell[1] + dy),
                     )
                     edge_cost = 1 if observed else uncertainty_cost
-                if (
-                    neighbor in blocked
-                    or neighbor not in passable
+                if contextual_edge in self.unsafe_navigation_edges and not (
+                    allow_unsafe_target_transition and neighbor == target
                 ):
+                    continue
+                if neighbor in blocked or neighbor not in passable:
                     continue
                 next_cost = cost + edge_cost
                 next_steps = steps + 1
@@ -2083,8 +2275,7 @@ class MechanismPolicy:
         # nearby, while still turning back before the experiment becomes unsafe.
         return bool(
             self._likely_refill_cells(state)
-            and self._resource_steps(state)
-            <= max(route_length + 3, 7)
+            and self._resource_steps(state) <= max(route_length + 3, 7)
         )
 
     def _route_to_refill_for_goal(
@@ -2202,6 +2393,123 @@ class MechanismPolicy:
     def _joint_state(state: MechanismState) -> JointMechanismState:
         return JointMechanismState(state.status_signature, state.status_color)
 
+    def _joint_navigation_decision(
+        self,
+        state: MechanismState,
+        targets: dict[Cell, MechanismObject],
+        names: list[str],
+    ) -> MechanismDecision | None:
+        """Search across status-changing motion before splitting it into Options.
+
+        If a complete route is unsupported, probe a reachable missing actuator
+        edge instead of repeating an already known state/action. The model is
+        level-local and each chosen step is checked on the next observation.
+        """
+        if (
+            not self.enable_joint_navigation
+            or state.player_position is None
+            or not self.special_transitions
+            or self._has_command_pair()
+            or self.active_actuator_probe is not None
+            or self.task_plan_controller.active_plan is not None
+        ):
+            return None
+        goals = {
+            NavigationNode(
+                cell, JointMechanismState(item.pattern_signature, item.pattern_color)
+            )
+            for cell, item in targets.items()
+            if cell not in self.dynamic_target_cells and item.pattern_color is not None
+        }
+        model = self.joint_navigation
+        effect_edges = [
+            (source, action, evidence.destination)
+            for (source, action), evidence in model.edges.items()
+            if evidence.destination is not None
+            and source.status != evidence.destination.status
+        ]
+        if not goals or not effect_edges:
+            return None
+        start = NavigationNode(
+            state.player_position, self._joint_state(state), self.motion_context.context
+        )
+        search_args = dict(
+            resource=state.resource_level,
+            capacity=state.resource_capacity,
+            default_cost=self.resource_cost,
+            passable=self.known_walkable | set(state.walkable_cells) | set(targets),
+            actions=names,
+        )
+        route = model.search(start, goals, **search_args)
+        if route is None:
+            route = model.search(start, goals, allow_predictions=True, **search_args)
+        if route is not None and route.steps:
+            step = route.steps[0]
+            self._expected_navigation_step = step
+            # Joint planning owns the entire mission; an old coordinate-only
+            # commitment must not resume underneath it on the next frame.
+            self.task_plan_controller.invalidate("joint_navigation_selected")
+            return MechanismDecision(
+                step.action,
+                "joint_navigation_goal",
+                route.steps[-1].destination.position,
+                len(route.steps),
+            )
+
+        # Only existing before/after statuses seed experiments. An unreachable
+        # desired status is not invented as an observed state.
+        statuses = {start.status}
+        for source, _, destination in effect_edges:
+            statuses.update((source.status, destination.status))
+        patterns = {status.pattern for status in statuses}
+        colors = {status.color for status in statuses}
+        statuses = {JointMechanismState(p, c) for p in patterns for c in colors}
+        frontier: dict[NavigationNode, str] = {}
+        for source, action, destination in effect_edges:
+            for status in statuses:
+                relevant = any(
+                    (
+                        source.status.color != destination.status.color
+                        and start.status.color != g.status.color
+                        and status.color != g.status.color
+                    )
+                    or (
+                        source.status.pattern != destination.status.pattern
+                        and start.status.pattern != g.status.pattern
+                        and status.pattern != g.status.pattern
+                    )
+                    for g in goals
+                )
+                node = NavigationNode(source.position, status, source.context)
+                if relevant and (node, action) not in model.edges:
+                    frontier.setdefault(node, action)
+        if not frontier:
+            return None
+        route = model.search(start, frontier, allow_predictions=True, **search_args)
+        if route is None:
+            return None
+        node = start if not route.steps else route.steps[-1].destination
+        if route.resource_remaining < self.resource_cost:
+            return None
+        self.task_plan_controller.invalidate("joint_navigation_experiment")
+        if route.steps:
+            step = route.steps[0]
+            self._expected_navigation_step = step
+            return MechanismDecision(
+                step.action,
+                "joint_navigation_frontier",
+                node.position,
+                len(route.steps) + 1,
+            )
+        action = frontier[node]
+        dx, dy = ACTION_DELTAS[action]
+        return MechanismDecision(
+            action,
+            "joint_navigation_experiment",
+            (node.position[0] + dx, node.position[1] + dy),
+            1,
+        )
+
     def _planning_state(self, state: MechanismState) -> PlanningState:
         return PlanningState(
             level=state.level,
@@ -2226,6 +2534,11 @@ class MechanismPolicy:
             ),
         )
         if self.task_plan_controller.consume_replan_request():
+            # Rebuilding can fail because the remaining resource or newly
+            # learned topology makes the mission infeasible.  The old plan's
+            # precondition is already contradicted; never keep executing it
+            # when no replacement can be installed.
+            self.task_plan_controller.invalidate("stage_precondition_changed")
             self._build_task_plan(state, targets)
 
     def _estimate_plan_steps(
@@ -2503,6 +2816,11 @@ class MechanismPolicy:
         self, state: MechanismState, names: list[str], target: Cell
     ) -> MechanismDecision | None:
         for action in names:
+            if (
+                self.enable_dynamic_contact
+                and self.observed_transitions.get((target, action)) == target
+            ):
+                continue
             dx, dy = ACTION_DELTAS[action]
             neighbor = (target[0] + dx, target[1] + dy)
             if neighbor in self.known_walkable or neighbor in state.walkable_cells:
@@ -2526,7 +2844,7 @@ class MechanismPolicy:
             self.active_actuator_probe = None
             return None
         target, dimension = probe
-        route = self._route(state, target)
+        route = self._route(state, target, allow_unsafe_target_transition=True)
         if route is None:
             self.active_actuator_probe = None
             return None
@@ -2540,6 +2858,13 @@ class MechanismPolicy:
         for action in names:
             dx, dy = ACTION_DELTAS[action]
             neighbor = (target[0] + dx, target[1] + dy)
+            if (
+                self.enable_dynamic_contact
+                and self.observed_transitions.get((target, action)) == target
+            ):
+                # An apparently open floor cell is weaker evidence than the
+                # real failed departure. Do not burn the meter on that edge.
+                continue
             if neighbor in self.known_walkable or neighbor in state.walkable_cells:
                 return MechanismDecision(
                     action=action,
@@ -2549,10 +2874,157 @@ class MechanismPolicy:
                 )
         return None
 
+    def _dynamic_contact_decision(
+        self,
+        state: MechanismState,
+        targets: dict[Cell, MechanismObject],
+        names: list[str],
+    ) -> MechanismDecision | None:
+        """Use a supported moving contact, never a permanent actuator cell.
+
+        Two contacts are a bounded identification experiment. Thereafter only
+        a supported pattern orbit or discovery of a still-missing role may
+        interrupt the ordinary policy. All routes execute one action at a time.
+        """
+        model = self.dynamic_contact
+        if (
+            not self.enable_dynamic_contact
+            or self._has_command_pair()
+            or state.player_position is None
+            or state.player_confidence < 0.8
+            or len(model.moving) != 1
+            or self.task_plan_controller.active_plan is not None
+        ):
+            return None
+        signature = next(iter(model.moving))
+        track = model.tracks.get(signature)
+        if track is None or track.phase is None:
+            return None
+        # Do not disturb a fully aligned completion objective.
+        goals = [
+            item
+            for cell, item in targets.items()
+            if cell not in self.dynamic_target_cells
+        ]
+        if any(
+            item.internal_pattern == state.status_pattern
+            and self._colors_compatible(item.pattern_color, state.status_color)
+            for item in goals
+        ):
+            return None
+
+        def destination(source: Cell, action: str) -> Cell | None:
+            edge = (source, action)
+            context = (source, action, state.status_signature, state.status_color)
+            # Nonlocal/unsafe edges may advance the clock differently. Their
+            # effects are outside this deliberately local contact search.
+            if (
+                edge in self.special_transitions
+                or context in self.unsafe_navigation_edges
+            ):
+                return None
+            observed = self.observed_transitions.get(edge)
+            dx, dy = ACTION_DELTAS[action]
+            target = (
+                observed if observed is not None else (source[0] + dx, source[1] + dy)
+            )
+            if target not in (
+                self.known_walkable | set(state.walkable_cells) | {source}
+            ):
+                return None
+            return target
+
+        samples = model.effect_samples[(signature, True)]
+        desired = None
+        objective = "identify_dynamic_contact"
+        if samples >= model.MIN_SUPPORT:
+            next_pattern = model.pattern_after(signature, state.status_pattern)
+            if next_pattern is None:
+                return None
+            # Find a reachable target in the learned D4 orbit, not merely an
+            # arbitrary status change that would repeat forever.
+            orbit = {state.status_pattern}
+            pattern = state.status_pattern
+            reachable = False
+            for _ in range(7):
+                pattern = model.pattern_after(signature, pattern)
+                if pattern is None or pattern in orbit:
+                    break
+                orbit.add(pattern)
+                if any(item.internal_pattern == pattern for item in goals):
+                    reachable = True
+                    break
+            if reachable and next_pattern != state.status_pattern:
+                desired = next_pattern
+                objective = "align_dynamic_pattern"
+            elif (
+                model.preserves_color(signature)
+                and any(
+                    not self._colors_compatible(item.pattern_color, state.status_color)
+                    for item in goals
+                )
+                and not self.palette_changer_cells
+            ):
+                # This mechanism cannot correct the missing palette. Test an
+                # unexplained static candidate instead of rotating indefinitely.
+                moving_cells = {
+                    item.current
+                    for key, item in model.tracks.items()
+                    if key in model.moving
+                }
+                for cell in self._role_discovery_cells(state, "palette"):
+                    if cell in moving_cells:
+                        continue
+                    route = self._route(state, cell)
+                    if route is None:
+                        continue
+                    if self._needs_discovery_refill(state, len(route)):
+                        refill = self._route_to_refill_for_goal(state, cell)
+                        if refill is not None and refill[0] != state.player_position:
+                            return self._decision_for_route(
+                                refill[1],
+                                "restore_resource"
+                                if refill[0] in self._visible_refill_cells(state)
+                                else "discover_resource_source",
+                                refill[0],
+                                names,
+                            )
+                    if route:
+                        return self._decision_for_route(
+                            route, "discover_palette_changer", cell, names
+                        )
+                    return self._contact_probe(state, cell, names)
+                return None
+            else:
+                return None
+        horizon = min(6, max(0, self._resource_steps(state) - 3))
+        proposal = model.contact_route(
+            state,
+            signature,
+            destination,
+            names,
+            goal_pattern=desired,
+            horizon=horizon,
+        )
+        if proposal is None:
+            return None
+        path, contact = proposal
+        if self._needs_discovery_refill(state, len(path)):
+            return None
+        return MechanismDecision(
+            path[0],
+            objective,
+            contact.player_after,
+            len(path),
+            signature if len(path) == 1 else None,
+        )
+
     def choose(
         self,
         state: MechanismState | None,
         available_actions: Iterable[Any],
+        *,
+        previous_action: str | None = None,
     ) -> GameAction | None:
         if not self.enabled or state is None or state.layout is None:
             return None
@@ -2566,7 +3038,20 @@ class MechanismPolicy:
             return None
         if self.level != state.level:
             self._reset_level(state.level)
-        self._update_evidence(state)
+        self._update_evidence(state, actual_action=previous_action)
+        if (
+            self.enable_entity_options
+            and self.enable_dynamic_contact
+            and self.enable_contact_effects
+        ):
+            self.entity_options.observe(state, self.dynamic_contact, previous_action)
+        if self.enable_option_compiler and self.enable_dynamic_contact:
+            self.option_controller.observe(
+                state,
+                previous_action,
+                self.dynamic_contact,
+                self.joint_mechanism_graph.transitions(),
+            )
 
         # A synchronized command pair is stronger evidence than the compact
         # static-looking cell beneath the player. Stop any old depart/re-enter
@@ -2589,6 +3074,80 @@ class MechanismPolicy:
         targets = self._static_targets(state)
         self._observe_task_plan(state, targets)
 
+        if (
+            self.enable_entity_options
+            and self.enable_dynamic_contact
+            and self.enable_contact_effects
+            and not self._has_command_pair()
+        ):
+            step = self.entity_options.choose(
+                state,
+                self.dynamic_contact,
+                self.contact_effects,
+                {
+                    cell: (item.internal_pattern, item.pattern_color)
+                    for cell, item in targets.items()
+                    if cell not in self.dynamic_target_cells
+                },
+                names,
+            )
+            if step is not None:
+                self.task_plan_controller.invalidate("entity_option_selected")
+                self._probe_return = None
+                self.active_actuator_probe = None
+                self._clear_dynamic_plan()
+                return self._set_decision(
+                    state,
+                    MechanismDecision(
+                        step.action,
+                        self.entity_options.objective,
+                        step.after.player,
+                        len(self.entity_options.remaining) + 1,
+                        step.contact,
+                    ),
+                )
+
+        if (
+            self.enable_option_compiler
+            and self.enable_dynamic_contact
+            and not self._has_command_pair()
+        ):
+            step = self.option_controller.choose(
+                state,
+                self.dynamic_contact,
+                (
+                    (
+                        cell,
+                        JointMechanismState(item.pattern_signature, item.pattern_color),
+                    )
+                    for cell, item in sorted(targets.items())
+                    if cell not in self.dynamic_target_cells
+                ),
+                names,
+                resource_cost=self.resource_cost,
+            )
+            if step is not None:
+                self.task_plan_controller.invalidate("compiled_option_selected")
+                self._probe_return = None
+                self.active_actuator_probe = None
+                self._clear_dynamic_plan()
+                return self._set_decision(
+                    state,
+                    MechanismDecision(
+                        action=step.action,
+                        objective="execute_compiled_option",
+                        target=step.after.player,
+                        route_length=len(self.option_controller.remaining) + 1,
+                    ),
+                )
+
+        dynamic_contact_decision = self._dynamic_contact_decision(state, targets, names)
+        if dynamic_contact_decision is not None:
+            self.task_plan_controller.invalidate("dynamic_contact_selected")
+            self._probe_return = None
+            self.active_actuator_probe = None
+            return self._set_decision(state, dynamic_contact_decision)
+
         # Execute an installed multi-stage plan before allowing local
         # objectives to compete again.  Dynamic command-coupled mechanisms
         # retain their dedicated joint planner; this first task-planning slice
@@ -2597,6 +3156,10 @@ class MechanismPolicy:
             planned = self._task_plan_decision(state, names)
             if planned is not None:
                 return self._set_decision(state, planned)
+
+        joint_decision = self._joint_navigation_decision(state, targets, names)
+        if joint_decision is not None:
+            return self._set_decision(state, joint_decision)
 
         pending_completion = self.pending_interaction
         event_types = {event.event_type for event in state.events}
@@ -2957,6 +3520,17 @@ class MechanismPolicy:
             f"command_tracks={len(self.command_dynamic_signatures)} "
             f"dynamic_targets={sorted(self.dynamic_target_cells)} "
             f"joint_edges={len(self.joint_mechanism_graph.transitions())} "
+            f"navigation_edges={len(self.joint_navigation.edges)} "
+            f"navigation_conflicts={self.joint_navigation.counterexamples} "
+            f"motion_context_tracks={len(self.motion_context.context)} "
+            f"contact_tracks={len(self.dynamic_contact.moving)} "
+            f"contact_effect_samples={sum(self.dynamic_contact.effect_samples.values())} "
+            f"compiled_plans={self.option_controller.metrics['installed_plans']} "
+            f"compiled_checks={self.option_controller.metrics['prediction_checks']} "
+            f"compiled_errors={self.option_controller.metrics['prediction_errors']} "
+            f"navigation_predictions={self.joint_prediction_checks} "
+            f"navigation_errors={self.joint_prediction_errors} "
+            f"navigation_search={self.joint_navigation.last_search} "
             f"{self.task_plan_controller.summary()} "
             f"objective={None if decision is None else decision.objective} "
             f"target={None if decision is None else decision.target}"
