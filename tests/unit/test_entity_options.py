@@ -712,7 +712,7 @@ def test_fixture_experiment_requires_same_appearance_evidence_and_abstains_on_mi
 
 
 def test_nonlocal_arrival_cell_suppresses_geometric_from_different_edges():
-    """After observing edge A is nonlocal, only that exact edge is affected, not all arrivals."""
+    """Hybrid: exact edge returns relocation, other approaches to arrival suppressed."""
     controller, observation, clock, memory, _, _ = fixture()
 
     # Mark edge (7,3)+ACTION4 as known nonlocal with destination
@@ -727,12 +727,10 @@ def test_nonlocal_arrival_cell_suppresses_geometric_from_different_edges():
     movement_exact = model.movement(node_at_7_3, "ACTION4")
     assert movement_exact == ((6, 3), "nonlocal_edge_relocation")
 
-    # But OTHER approaches to (8,3) can still use geometric navigation
-    # because we don't over-generalize to all arrivals
+    # OTHER approaches to (8,3) are suppressed to prevent prediction errors
     node_at_8_2 = replace(model.bind(observation, clock), player=(8, 2))
     movement_other = model.movement(node_at_8_2, "ACTION2")
-    if (8, 3) in model.projection:
-        assert movement_other == ((8, 3), "geometric_navigation_projection")
+    assert movement_other is None  # Suppressed (arrival is known nonlocal)
 
 
 def test_nonlocal_arrival_suppression_only_blocks_geometric_not_contextual():
@@ -787,17 +785,14 @@ def test_multiple_nonlocal_edges_accumulate_suppressed_arrivals():
     node_at_5_5 = replace(model.bind(observation, clock), player=(5, 5))
     assert model.movement(node_at_5_5, "ACTION2") == ((4, 5), "nonlocal_edge_relocation")
 
-    # But other approaches to those targets can use geometric navigation
+    # Other approaches to those arrivals are suppressed
     node_at_8_2 = replace(model.bind(observation, clock), player=(8, 2))
-    if (8, 3) in model.projection:
-        assert model.movement(node_at_8_2, "ACTION2") == (
-            (8, 3),
-            "geometric_navigation_projection",
-        )
+    # (8,2)+ACTION2 targets (8,3) which is a known arrival - suppressed
+    assert model.movement(node_at_8_2, "ACTION2") is None
 
 
 def test_arrival_suppression_does_not_affect_other_directions():
-    """Exact-edge suppression only affects that specific edge, not other approaches."""
+    """Hybrid: arrival suppression blocks all approaches, unrelated directions work."""
     controller, observation, clock, memory, _, _ = fixture()
 
     # Mark edge (7,3)+ACTION4 as nonlocal with destination
@@ -810,13 +805,12 @@ def test_arrival_suppression_does_not_affect_other_directions():
     node_at_7_3 = replace(model.bind(observation, clock), player=(7, 3))
     assert model.movement(node_at_7_3, "ACTION4") == ((6, 3), "nonlocal_edge_relocation")
 
-    # But OTHER approaches to (8,3) can use geometric if not observed nonlocal
+    # OTHER approaches to (8,3) are suppressed (it's a known arrival)
     node_at_8_4 = replace(model.bind(observation, clock), player=(8, 4))
-    if (8, 3) in model.projection:
-        movement_to_target = model.movement(node_at_8_4, "ACTION1")
-        assert movement_to_target == ((8, 3), "geometric_navigation_projection")
+    movement_to_arrival = model.movement(node_at_8_4, "ACTION1")
+    assert movement_to_arrival is None  # Suppressed
 
-    # And unrelated directions still work normally
+    # But unrelated directions still work normally
     movement_left = model.movement(node_at_8_4, "ACTION3")
     if (7, 4) in model.projection:
         assert movement_left is not None
@@ -920,24 +914,20 @@ def test_nonlocal_arrival_returns_relocation_destination_not_none():
 
 
 def test_nonlocal_arrival_relocation_works_for_multiple_edges_same_destination():
-    """Other edges targeting the same cell can still use geometric navigation."""
+    """Hybrid: other edges targeting known arrival are suppressed."""
     controller, observation, clock, memory, _, _ = fixture()
 
-    # Only (7,3)+ACTION4 is observed nonlocal, not all approaches to (8,3)
+    # (7,3)+ACTION4 is observed nonlocal, so (8,3) is a known arrival
     controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
     controller.nonlocal_edge_destinations = {((7, 3), "ACTION4"): (6, 3)}
 
     model = EntityOptionModel(controller, observation, clock, memory, {})
 
-    # From (8,4), ACTION1 targets (8,3) but hasn't been observed nonlocal
-    # Should use geometric navigation if (8,3) is in projection
+    # From (8,4), ACTION1 targets (8,3) which is a known arrival
+    # Should be suppressed to prevent prediction errors
     node_at_8_4 = replace(model.bind(observation, clock), player=(8, 4))
     movement = model.movement(node_at_8_4, "ACTION1")
-
-    if (8, 3) in model.projection:
-        assert movement is not None
-        assert movement[0] == (8, 3)
-        assert movement[1] == "geometric_navigation_projection"
+    assert movement is None  # Suppressed
 
 
 def test_conflicting_arrival_destinations_blocked():
