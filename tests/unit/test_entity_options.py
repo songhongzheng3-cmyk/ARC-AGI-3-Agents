@@ -362,6 +362,31 @@ def test_special_transition_works_in_goal_search():
     assert any("contextual_special_transition" in step.hypotheses for step in path)
 
 
+def test_mechanism_policy_signature_keys_converted_to_pattern():
+    """MechanismPolicy passes signature strings; model converts to Pattern."""
+    from agents.mechanism_state_tracker import pattern_key
+
+    controller, observation, clock, memory, _, _ = fixture()
+    # MechanismPolicy stores keys with signature strings like "010/111/010"
+    signature_str = pattern_key(PATTERN)
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", signature_str, 14): (6, 3),
+    }
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+    start = model.bind(observation, clock)
+
+    # Model should convert signature string to Pattern and find the transition
+    step = model.step(start, "ACTION4")
+    assert step is not None
+    assert step.after.player == (6, 3)
+    assert "contextual_special_transition" in step.hypotheses
+
+    # Verify the key was actually converted
+    assert ((3, 3), "ACTION4", PATTERN, 14) in model.special_transitions
+    # Original signature-string key should not be in model's dict
+    assert ((3, 3), "ACTION4", signature_str, 14) not in model.special_transitions
+
+
 def test_new_evidence_invalidates_retained_plan_before_next_action():
     controller, observation, clock, memory, model, start = fixture()
     controller.model = model
