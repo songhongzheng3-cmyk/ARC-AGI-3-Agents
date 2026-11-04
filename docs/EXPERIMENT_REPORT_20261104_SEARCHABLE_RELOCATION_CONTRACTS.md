@@ -1,6 +1,6 @@
 # Searchable Relocation Navigation Contracts (2026-11-04)
 
-**Status: FIXED (signature→Pattern key conversion added)**
+**Status: FIXED (signature→Pattern conversion + bad_edges override)**
 
 ## Scope
 
@@ -172,13 +172,73 @@ The model now converts all incoming keys from signature strings to Pattern tuple
 
 This test would have caught the original bug.
 
+## Second Post-Merge Fix (2026-11-04)
+
+### Second Bug After PR #3 Merge
+
+Checkpoint validation at freeze-row 620 with PR #3 fix still showed:
+- ❌ **0 executed steps used hypothesis `contextual_special_transition`**
+- ❌ Same 2 prediction_errors at (7,3)+ACTION4 and (8,2)+ACTION2
+- ❌ Both still expected geometric, actual (6,3)
+
+**Root cause**: Check order in `movement()` method:
+
+```python
+# OLD ORDER (broken):
+if edge in self.failures:  # checked FIRST
+    return None
+# special_transitions checked after, but never reached
+```
+
+When a prediction mismatch occurred:
+1. `EntityOptionController` added edge to `bad_edges`
+2. Next plan rebuild: `movement()` rejected edge immediately
+3. Special transition check never executed
+4. Planning kept using geometric projections
+
+### Second Fix Applied
+
+Reordered checks in `EntityOptionModel.movement()`:
+
+```python
+# NEW ORDER (working):
+# Check special transitions FIRST
+contextual_key = (node.player, action, node.pattern, node.color)
+if contextual_key in self.special_transitions:
+    destination = self.special_transitions[contextual_key]
+    return destination, "contextual_special_transition"
+
+# Only reject as bad edge if no special transition exists
+if edge in self.failures:
+    return None
+```
+
+**Rationale**: A learned special transition is a verified navigation contract that overrides the initial "bad edge" designation from first observation.
+
+### Integration Test Added
+
+**`test_learned_special_transition_overrides_bad_edge_after_mismatch()`** verifies:
+- ✅ Plan expects geometric → observe relocation → edge added to bad_edges
+- ✅ MechanismPolicy records relocation as special transition
+- ✅ After invalidation/rebuild, `movement()` returns `"contextual_special_transition"`
+- ✅ Edge is NOT blocked by bad_edges check
+- ✅ `step()` uses the special transition
+- ✅ Goal search can find paths using the special transition
+
+**This test would have caught the second bug.**
+
 ## Files Changed
 
-- `agents/entity_options.py` (+33 lines: signature converter, key conversion logic, movement check, step condition)
+- `agents/entity_options.py` (+45 lines: signature converter, key conversion logic, reordered movement checks, step condition)
 - `agents/mechanism_policy.py` (+1 line: pass special_transitions)
-- `tests/unit/test_entity_options.py` (+106 lines: 6 new tests including integration test)
+- `tests/unit/test_entity_options.py` (+148 lines: 7 new tests including 2 integration tests)
 
-**Git diff**: 2 files changed, 140 insertions(+), 2 deletions(-)
+**Cumulative changes**:
+- First implementation (PR #2): searchable relocation contracts framework
+- First fix (PR #3): signature→Pattern key conversion
+- Second fix (this PR): bad_edges check reordering
+
+**Final diff**: 2 files changed, 194 insertions(+), 6 deletions(-)
 
 ## Open Questions
 
