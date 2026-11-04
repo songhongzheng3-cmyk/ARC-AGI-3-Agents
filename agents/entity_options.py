@@ -186,14 +186,18 @@ class EntityOptionModel:
 
     def movement(self, node, action):
         edge = node.player, action
-        if edge in self.failures:
-            return None
 
-        # Check for consistent contextual special transitions first
+        # Check for consistent contextual special transitions BEFORE bad_edges.
+        # A learned special transition is a verified navigation contract that
+        # overrides the initial "bad edge" designation from first observation.
         contextual_key = (node.player, action, node.pattern, node.color)
         if contextual_key in self.special_transitions:
             destination = self.special_transitions[contextual_key]
             return destination, "contextual_special_transition"
+
+        # Only reject as bad edge if no special transition exists
+        if edge in self.failures:
+            return None
 
         samples = self.navigation.get(edge, ())
         tiers = (

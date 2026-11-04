@@ -387,6 +387,48 @@ def test_mechanism_policy_signature_keys_converted_to_pattern():
     assert ((3, 3), "ACTION4", signature_str, 14) not in model.special_transitions
 
 
+def test_learned_special_transition_overrides_bad_edge_after_mismatch():
+    """After prediction mismatch, special transition remains searchable."""
+    from agents.mechanism_state_tracker import pattern_key
+
+    controller, observation, clock, memory, _, _ = fixture()
+    signature_str = pattern_key(PATTERN)
+
+    # First: plan expects geometric move (3,3) + ACTION4 -> (4,3)
+    # But observe actual relocation to (6,3)
+    # This adds ((3,3), "ACTION4") to bad_edges
+    controller.bad_edges.add(((3, 3), "ACTION4"))
+
+    # Meanwhile, MechanismPolicy records the observed relocation as special transition
+    controller.special_transitions = {
+        ((3, 3), "ACTION4", signature_str, 14): (6, 3),
+    }
+
+    # Build new model after invalidation
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+    start = model.bind(observation, clock)
+
+    # Special transition should override bad_edge; movement should work
+    movement = model.movement(start, "ACTION4")
+    assert movement is not None
+    assert movement[0] == (6, 3)
+    assert movement[1] == "contextual_special_transition"
+
+    # step() should also work and use the special transition
+    step = model.step(start, "ACTION4")
+    assert step is not None
+    assert step.after.player == (6, 3)
+    assert "contextual_special_transition" in step.hypotheses
+
+    # Goal search should be able to use this edge
+    targets = {(6, 3): (PATTERN, 14)}
+    model_with_target = EntityOptionModel(controller, observation, clock, memory, targets)
+    start_with_target = model_with_target.bind(observation, clock)
+    path, _ = model_with_target.search_goal(start_with_target, NAMES)
+    assert path is not None
+    assert any("contextual_special_transition" in step.hypotheses for step in path)
+
+
 def test_new_evidence_invalidates_retained_plan_before_next_action():
     controller, observation, clock, memory, model, start = fixture()
     controller.model = model
