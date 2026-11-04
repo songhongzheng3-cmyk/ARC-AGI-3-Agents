@@ -93,10 +93,16 @@ class EntityOptionModel:
         self.failures = set(controller.bad_edges)
         self.rejected_entries = set(controller.rejected_entries)
         # Store edges known to be non-local (from MechanismPolicy.special_transitions)
-        # Model ONLY exact observed edges as relocations, not all approaches to an arrival.
+        # Hybrid approach: exact edges are searchable relocations, unobserved approaches suppressed.
         self.known_nonlocal_edges = set(controller.known_nonlocal_edges)
-        # Store the edge→destination mapping for nonlocal edges
+        # Store the edge→destination mapping for nonlocal edges (for exact-edge relocation)
         self.nonlocal_edge_destinations = dict(controller.nonlocal_edge_destinations)
+        # Derive arrival cells to suppress geometric navigation from unobserved approaches
+        # This prevents prediction errors while allowing exact edges to return destinations.
+        self.known_nonlocal_arrivals = {
+            (cell[0] + ACTION_DELTAS[action][0], cell[1] + ACTION_DELTAS[action][1])
+            for cell, action in self.known_nonlocal_edges
+        }
         # Convert MechanismPolicy contextual_special_transitions keys from
         # (cell, action, signature_string, color) to (cell, action, Pattern, color)
         self.special_transitions = {}
@@ -243,6 +249,11 @@ class EntityOptionModel:
                 return (next(iter(outputs)), label) if len(outputs) == 1 else None
         dx, dy = ACTION_DELTAS[action]
         target = node.player[0] + dx, node.player[1] + dy
+        # Suppress geometric navigation into known nonlocal arrival cells from unobserved edges.
+        # Exact edges with destinations are already handled above (return relocation).
+        # This prevents prediction errors when approaching portal pads from other directions.
+        if target in self.known_nonlocal_arrivals:
+            return None
         if target in self.projection or target in self.targets:
             return target, "geometric_navigation_projection"
         return None
