@@ -422,7 +422,9 @@ def test_learned_special_transition_overrides_bad_edge_after_mismatch():
 
     # Goal search should be able to use this edge
     targets = {(6, 3): (PATTERN, 14)}
-    model_with_target = EntityOptionModel(controller, observation, clock, memory, targets)
+    model_with_target = EntityOptionModel(
+        controller, observation, clock, memory, targets
+    )
     start_with_target = model_with_target.bind(observation, clock)
     path, _ = model_with_target.search_goal(start_with_target, NAMES)
     assert path is not None
@@ -707,3 +709,106 @@ def test_fixture_experiment_requires_same_appearance_evidence_and_abstains_on_mi
         )
         is None
     )
+
+
+def test_nonlocal_arrival_cell_suppresses_geometric_from_different_edges():
+    """After observing edge A is nonlocal, edge B targeting same arrival is suppressed."""
+    controller, observation, clock, memory, _, _ = fixture()
+
+    # Mark edge (7,3)+ACTION4 as known nonlocal
+    # Its geometric target would be (7+1, 3) = (8, 3)
+    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
+
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+
+    # Create a node at (8, 2) with the same status context
+    node_at_8_2 = replace(
+        model.bind(observation, clock),
+        player=(8, 2),
+    )
+
+    # ACTION2 from (8,2) would geometrically target (8, 2+1) = (8, 3)
+    # This should be suppressed because (8,3) is a known nonlocal arrival
+    movement = model.movement(node_at_8_2, "ACTION2")
+    assert movement is None
+
+
+def test_nonlocal_arrival_suppression_only_blocks_geometric_not_contextual():
+    """Contextual special transitions still work even if arrival is known nonlocal."""
+    from agents.mechanism_state_tracker import pattern_key
+
+    controller, observation, clock, memory, _, _ = fixture()
+    signature_str = pattern_key(PATTERN)
+
+    # Mark edge (7,3)+ACTION4 as known nonlocal (geometric target is (8,3))
+    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
+
+    # But also provide a contextual special transition for a different edge
+    # targeting the same arrival cell (8,3)
+    controller.special_transitions = {
+        ((8, 2), "ACTION2", signature_str, 14): (8, 3),
+    }
+
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+
+    # Create node at (8, 2)
+    node_at_8_2 = replace(
+        model.bind(observation, clock),
+        player=(8, 2),
+    )
+
+    # Movement should return the contextual special transition, not None
+    movement = model.movement(node_at_8_2, "ACTION2")
+    assert movement is not None
+    assert movement[0] == (8, 3)
+    assert movement[1] == "contextual_special_transition"
+
+
+def test_multiple_nonlocal_edges_accumulate_suppressed_arrivals():
+    """Multiple nonlocal edges create multiple suppressed arrival cells."""
+    controller, observation, clock, memory, _, _ = fixture()
+
+    # Mark two different nonlocal edges with different geometric targets
+    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))  # targets (8, 3)
+    controller.known_nonlocal_edges.add(((5, 5), "ACTION2"))  # targets (5, 6)
+
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+
+    # Both arrival cells should be in the suppression set
+    assert (8, 3) in model.known_nonlocal_arrivals
+    assert (5, 6) in model.known_nonlocal_arrivals
+
+    # Geometric navigation into either arrival should be suppressed
+    node_at_8_2 = replace(model.bind(observation, clock), player=(8, 2))
+    assert model.movement(node_at_8_2, "ACTION2") is None
+
+    node_at_5_5_adj = replace(model.bind(observation, clock), player=(5, 5))
+    assert model.movement(node_at_5_5_adj, "ACTION2") is None
+
+
+def test_arrival_suppression_does_not_affect_other_directions():
+    """Arrival suppression only affects edges geometrically targeting that cell."""
+    controller, observation, clock, memory, _, _ = fixture()
+
+    # Mark edge (7,3)+ACTION4 as nonlocal (geometric target is (8, 3))
+    controller.known_nonlocal_edges.add(((7, 3), "ACTION4"))
+
+    model = EntityOptionModel(controller, observation, clock, memory, {})
+
+    # Create a node at (8, 4) - different Y coordinate
+    node_at_8_4 = replace(
+        model.bind(observation, clock),
+        player=(8, 4),
+    )
+
+    # ACTION1 from (8,4) would geometrically target (8, 3) which is suppressed
+    # But ACTION3 from (8,4) would target (7, 4) which should still work
+    movement_up = model.movement(node_at_8_4, "ACTION1")
+    assert movement_up is None  # Suppressed because targets (8,3)
+
+    movement_left = model.movement(node_at_8_4, "ACTION3")
+    # Should work if (7,4) is in projection
+    if (7, 4) in model.projection:
+        assert movement_left is not None
+        assert movement_left[0] == (7, 4)
+        assert movement_left[1] == "geometric_navigation_projection"

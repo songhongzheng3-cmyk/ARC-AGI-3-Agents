@@ -23,9 +23,7 @@ def _signature_to_pattern(signature: str) -> Pattern:
     if signature == "empty":
         return ()
     return tuple(
-        tuple(int(value) for value in row)
-        for row in signature.split("/")
-        if row
+        tuple(int(value) for value in row) for row in signature.split("/") if row
     )
 
 
@@ -97,10 +95,23 @@ class EntityOptionModel:
         # Store edges known to be non-local (from MechanismPolicy.special_transitions)
         # to suppress geometric projection on first contact
         self.known_nonlocal_edges = set(controller.known_nonlocal_edges)
+        # Derive arrival cells from known nonlocal edges - these are the cells
+        # that geometric projection would predict as destinations, but which are
+        # actually nonlocal bounce/relocation points. No edge should use geometric
+        # navigation to enter these cells unless backed by a contextual special transition.
+        self.known_nonlocal_arrivals = {
+            (cell[0] + ACTION_DELTAS[action][0], cell[1] + ACTION_DELTAS[action][1])
+            for cell, action in self.known_nonlocal_edges
+        }
         # Convert MechanismPolicy contextual_special_transitions keys from
         # (cell, action, signature_string, color) to (cell, action, Pattern, color)
         self.special_transitions = {}
-        for (cell, action, pattern_or_sig, color), dest in controller.special_transitions.items():
+        for (
+            cell,
+            action,
+            pattern_or_sig,
+            color,
+        ), dest in controller.special_transitions.items():
             # Handle both Pattern tuples (from tests) and signature strings (from MechanismPolicy)
             if isinstance(pattern_or_sig, str):
                 pattern = _signature_to_pattern(pattern_or_sig)
@@ -235,6 +246,12 @@ class EntityOptionModel:
                 return (next(iter(outputs)), label) if len(outputs) == 1 else None
         dx, dy = ACTION_DELTAS[action]
         target = node.player[0] + dx, node.player[1] + dy
+        # Suppress geometric navigation into cells that are known nonlocal arrival points.
+        # Once any edge bouncing from a cell is observed to be nonlocal, no other edge
+        # should use geometric projection to enter that geometric target cell, preventing
+        # prediction errors on different approaches to the same bounce destination.
+        if target in self.known_nonlocal_arrivals:
+            return None
         if target in self.projection or target in self.targets:
             return target, "geometric_navigation_projection"
         return None
